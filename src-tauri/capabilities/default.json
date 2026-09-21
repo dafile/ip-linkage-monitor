@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "默认窗口权限：允许事件监听与命令调用",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

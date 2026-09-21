@@ -1,0 +1,1348 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>掌上看家联动IP在线状态监控</title>
+<style>
+  :root {
+    --bg: #eef2f7;
+    --card: #ffffff;
+    --line: #e3e9f2;
+    --text: #1f2d3d;
+    --muted: #7b8a9f;
+    --primary: #2563c9;
+    --primary-dark: #1d4fa3;
+    --green: #16a34a;
+    --green-bg: #e8f8ee;
+    --red: #dc2626;
+    --red-bg: #fdecec;
+    --gray: #64748b;
+    --gray-bg: #eef1f5;
+    --amber: #d97706;
+    --amber-bg: #fdf3e3;
+    --radius: 14px;
+    --shadow: 0 1px 3px rgba(16, 30, 54, 0.08), 0 4px 14px rgba(16, 30, 54, 0.05);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    font-family: "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
+    background: var(--bg); color: var(--text); font-size: 14px;
+    overflow: hidden;
+  }
+  #app { display: flex; flex-direction: column; height: 100vh; }
+
+  /* ---------- 顶栏 ---------- */
+  .topbar {
+    display: flex; align-items: center; gap: 12px; padding: 0 20px; height: 58px; flex: none;
+    background: linear-gradient(100deg, #16345f 0%, #1d4fa3 55%, #2563c9 100%); color: #fff;
+  }
+  .topbar .logo {
+    width: 34px; height: 34px; border-radius: 9px; flex: none;
+    background: radial-gradient(circle at 34% 32%, #fff 0 18%, transparent 19%),
+                linear-gradient(135deg, #2f80ed, #174a94);
+    border: 1.5px solid rgba(255,255,255,.55); position: relative;
+  }
+  .topbar .logo::after {
+    content: ""; position: absolute; right: 4px; bottom: 4px; width: 8px; height: 8px;
+    border-radius: 50%; background: #2ecc71; border: 1.5px solid #fff;
+  }
+  .topbar h1 { font-size: 16px; font-weight: 600; letter-spacing: .5px; }
+  .topbar .sub { font-size: 11px; opacity: .75; margin-top: 2px; }
+  .topbar .spacer { flex: 1; }
+  .save-indicator {
+    font-size: 12px; color: rgba(255,255,255,.85); opacity: 0; transition: opacity .4s;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .save-indicator.show { opacity: 1; }
+  .top-pills { display: flex; gap: 8px; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px; padding: 4px 11px; border-radius: 999px;
+    font-size: 12px; background: rgba(255,255,255,.14); border: 1px solid rgba(255,255,255,.22);
+  }
+  .pill .dot { width: 8px; height: 8px; border-radius: 50%; background: #cbd5e1; }
+  .pill.ok .dot { background: #4ade80; box-shadow: 0 0 6px #4ade80; }
+  .pill.bad .dot { background: #f87171; }
+
+  /* ---------- 导航 ---------- */
+  nav.tabs {
+    display: flex; gap: 4px; background: var(--card); border-bottom: 1px solid var(--line);
+    padding: 0 16px; flex: none;
+  }
+  nav.tabs button {
+    appearance: none; border: none; background: none; cursor: pointer;
+    padding: 12px 18px; font-size: 14px; color: var(--muted); position: relative;
+    font-family: inherit;
+  }
+  nav.tabs button:hover { color: var(--text); }
+  nav.tabs button.active { color: var(--primary); font-weight: 600; }
+  nav.tabs button.active::after {
+    content: ""; position: absolute; left: 14px; right: 14px; bottom: 0; height: 2.5px;
+    background: var(--primary); border-radius: 2px 2px 0 0;
+  }
+
+  main { flex: 1; overflow-y: auto; padding: 18px 20px 26px; }
+  .tab-panel { display: none; max-width: 1180px; margin: 0 auto; }
+  .tab-panel.active { display: block; }
+
+  /* ---------- 卡片 ---------- */
+  .card {
+    background: var(--card); border-radius: var(--radius); box-shadow: var(--shadow);
+    padding: 18px 20px; margin-bottom: 16px; border: 1px solid rgba(227,233,242,.8);
+  }
+  .card h3 {
+    font-size: 14px; font-weight: 600; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  }
+  .card h3 .icon { font-size: 15px; }
+  .card h3 .hint { font-size: 12px; color: var(--muted); font-weight: 400; margin-left: auto; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+  .grid .card { margin-bottom: 0; }
+  .grid + .card { margin-top: 16px; }
+
+  /* ---------- 状态展示 ---------- */
+  .ip-hero { display: flex; align-items: center; gap: 16px; }
+  .ip-hero .ring {
+    width: 64px; height: 64px; border-radius: 50%; flex: none;
+    display: flex; align-items: center; justify-content: center;
+    background: var(--gray-bg); transition: all .3s;
+  }
+  .ip-hero .ring.online { background: var(--green-bg); }
+  .ip-hero .ring.offline { background: var(--red-bg); }
+  .ip-hero .ring .core { width: 26px; height: 26px; border-radius: 50%; background: #94a3b8; transition: all .3s; }
+  .ip-hero .ring.online .core { background: var(--green); box-shadow: 0 0 0 6px rgba(22,163,74,.15); }
+  .ip-hero .ring.offline .core { background: var(--red); box-shadow: 0 0 0 6px rgba(220,38,38,.12); }
+  .ip-hero .info { flex: 1; min-width: 0; }
+  .ip-hero .state-word { font-size: 20px; font-weight: 700; }
+  .ip-hero .state-word.online { color: var(--green); }
+  .ip-hero .state-word.offline { color: var(--red); }
+  .ip-hero .ip { font-size: 13px; color: var(--muted); margin-top: 2px; font-family: Consolas, monospace; }
+  .kv { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 16px; margin-top: 14px; }
+  .kv .item { background: #f7f9fc; border-radius: 10px; padding: 8px 12px; }
+  .kv .item .k { font-size: 11px; color: var(--muted); margin-bottom: 3px; }
+  .kv .item .v { font-size: 13px; font-weight: 600; font-family: Consolas, monospace; }
+
+  .badge {
+    display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px;
+    font-size: 12px; font-weight: 600;
+  }
+  .badge.running { background: var(--green-bg); color: var(--green); }
+  .badge.stopped { background: var(--gray-bg); color: var(--gray); }
+
+  /* ---------- 开关 ---------- */
+  .switch-row { display: flex; align-items: center; gap: 12px; }
+  .switch { position: relative; width: 46px; height: 26px; flex: none; cursor: pointer; }
+  .switch input { display: none; }
+  .switch .track {
+    position: absolute; inset: 0; border-radius: 999px; background: #cbd5e1; transition: .25s;
+  }
+  .switch .thumb {
+    position: absolute; top: 3px; left: 3px; width: 20px; height: 20px; border-radius: 50%;
+    background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.25); transition: .25s;
+  }
+  .switch input:checked + .track { background: var(--green); }
+  .switch input:checked ~ .thumb { left: 23px; }
+  .switch-row .desc { color: var(--muted); font-size: 12.5px; line-height: 1.5; }
+  .switch.sm { width: 38px; height: 22px; }
+  .switch.sm .thumb { width: 16px; height: 16px; }
+  .switch.sm input:checked ~ .thumb { left: 19px; }
+
+  /* ---------- 待执行任务 ---------- */
+  .pending-item {
+    display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 10px;
+    background: var(--amber-bg); border: 1px solid #f3ddb5; margin-top: 8px; font-size: 13px;
+  }
+  .pending-item .p-main { flex: 1; min-width: 0; }
+  .pending-item .p-title { color: #92600a; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pending-item .p-sub { color: #b07d2b; font-size: 12px; margin-top: 2px; }
+  .pending-item .count { font-family: Consolas, monospace; font-weight: 700; color: var(--amber); font-size: 16px; }
+
+  /* ---------- 规则摘要（控制台） ---------- */
+  .rule-brief {
+    display: flex; align-items: center; gap: 8px; padding: 7px 12px; border-radius: 9px;
+    background: #f7f9fc; margin-top: 8px; font-size: 12.5px; color: var(--text);
+  }
+  .rule-brief .rb-arrow { color: var(--muted); }
+  .rule-brief .rb-note { color: var(--muted); margin-left: auto; font-size: 11.5px; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rule-brief.disabled { opacity: .5; }
+  .tag { display: inline-block; padding: 1px 8px; border-radius: 5px; font-size: 11px; font-weight: 700; white-space: nowrap; }
+  .tag.online { background: var(--green-bg); color: var(--green); }
+  .tag.offline { background: var(--gray-bg); color: var(--gray); }
+
+  /* ---------- 按钮 ---------- */
+  .btn {
+    appearance: none; border: 1px solid var(--line); background: #fff; color: var(--text);
+    border-radius: 9px; padding: 8px 16px; font-size: 13px; cursor: pointer; font-family: inherit;
+    display: inline-flex; align-items: center; gap: 6px; transition: all .15s; white-space: nowrap;
+  }
+  .btn:hover { border-color: #b9c6d8; background: #f8fafc; }
+  .btn:active { transform: translateY(1px); }
+  .btn:disabled { opacity: .5; cursor: not-allowed; transform: none; }
+  .btn.primary { background: var(--primary); border-color: var(--primary); color: #fff; }
+  .btn.primary:hover { background: var(--primary-dark); }
+  .btn.danger { background: #fff; border-color: #f2b8b5; color: var(--red); }
+  .btn.danger:hover { background: var(--red-bg); }
+  .btn.success { background: var(--green); border-color: var(--green); color: #fff; }
+  .btn.success:hover { background: #12813b; }
+  .btn.sm { padding: 5px 12px; font-size: 12px; border-radius: 7px; }
+  .btn.xs { padding: 2px 9px; font-size: 11.5px; border-radius: 6px; }
+  .btn-row { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; align-items: center; }
+
+  /* ---------- 表单 ---------- */
+  .form-row { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }
+  .form-row label { width: 130px; flex: none; font-size: 13px; color: var(--text); font-weight: 500; }
+  .form-row .control { flex: 1; min-width: 220px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  input[type="text"], input[type="number"], input[type="date"], select {
+    font-family: inherit; font-size: 13px; color: var(--text);
+    border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: #fff;
+    outline: none; transition: border .15s, box-shadow .15s;
+  }
+  input:focus, select:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(37,99,201,.12); }
+  input[type="text"].mono { font-family: Consolas, monospace; }
+  input[readonly] { background: #f7f9fc; color: var(--muted); }
+  .path-input { flex: 1; min-width: 200px; }
+  .validity { font-size: 12px; display: inline-flex; align-items: center; gap: 4px; }
+  .validity.ok { color: var(--green); }
+  .validity.bad { color: var(--red); }
+  .inline-result { font-size: 12.5px; }
+  .inline-result.online { color: var(--green); }
+  .inline-result.offline { color: var(--red); }
+  .form-note { font-size: 12px; color: var(--muted); line-height: 1.6; margin-top: 4px; }
+  details.adv { border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; background: #fbfcfe; }
+  details.adv summary { cursor: pointer; font-size: 13px; font-weight: 600; color: var(--muted); user-select: none; }
+  details.adv .form-row { margin-top: 12px; margin-bottom: 0; }
+
+  /* ---------- 规则卡片 ---------- */
+  .rule-card {
+    border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; margin-bottom: 12px;
+    background: #fbfcfe; transition: border .15s;
+  }
+  .rule-card:hover { border-color: #c6d3e6; }
+  .rule-card.disabled { opacity: .62; }
+  .rule-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .rule-head .rid {
+    font-family: Consolas, monospace; font-size: 11px; color: var(--muted);
+    background: var(--gray-bg); border-radius: 6px; padding: 2px 7px;
+  }
+  .rule-head input.note { flex: 1; min-width: 160px; border: none; background: transparent; font-weight: 600; font-size: 13.5px; padding: 4px 6px; border-radius: 6px; }
+  .rule-head input.note:hover, .rule-head input.note:focus { background: #fff; border: 1px solid var(--line); }
+  .rule-body { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
+  .rule-body .field { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--muted); }
+  .rule-body select { padding: 6px 8px; font-size: 12.5px; }
+  .rule-body input[type="number"] { width: 76px; padding: 6px 8px; font-size: 12.5px; }
+  .chip {
+    appearance: none; border: 1px solid var(--line); background: #fff; color: var(--muted);
+    border-radius: 999px; padding: 3px 10px; font-size: 11.5px; cursor: pointer; font-family: inherit;
+  }
+  .chip:hover { border-color: var(--primary); color: var(--primary); }
+  .chip.active { background: var(--primary); border-color: var(--primary); color: #fff; }
+  .run-subform {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px;
+    padding: 10px 12px; background: #f1f5fb; border-radius: 9px; width: 100%;
+  }
+  .run-subform input[type="text"] { flex: 1; min-width: 220px; padding: 6px 9px; font-size: 12.5px; }
+  .run-subform input.args { min-width: 140px; max-width: 260px; flex: none; }
+  .run-subform .chk { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); cursor: pointer; user-select: none; }
+  .rules-toolbar { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 4px; }
+
+  /* ---------- 保存栏 ---------- */
+  .savebar {
+    position: sticky; bottom: 0; z-index: 5; display: flex; align-items: center; gap: 12px;
+    background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+    padding: 10px 16px; margin-top: 16px; box-shadow: var(--shadow);
+  }
+  .savebar #saveState { font-size: 13px; }
+  .savebar #saveState.dirty { color: var(--amber); font-weight: 600; }
+  .savebar #saveState.clean { color: var(--muted); }
+  .savebar .btn { margin-left: auto; }
+
+  /* ---------- 日志 ---------- */
+  .log-toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 12px; }
+  .log-toolbar .sep { width: 1px; height: 22px; background: var(--line); }
+  .chk-group { display: flex; align-items: center; gap: 4px; font-size: 12.5px; color: var(--muted); }
+  .chk-group label { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; padding: 3px 6px; border-radius: 6px; user-select: none; }
+  .chk-group label:hover { background: #f1f5f9; }
+  .log-count { font-size: 12px; color: var(--muted); margin-left: auto; }
+  .table-wrap { border: 1px solid var(--line); border-radius: 10px; overflow: auto; max-height: calc(100vh - 300px); min-height: 300px; }
+  table.logs { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  table.logs thead th {
+    position: sticky; top: 0; background: #f6f8fb; text-align: left; padding: 9px 12px;
+    font-weight: 600; color: var(--muted); border-bottom: 1px solid var(--line); white-space: nowrap; z-index: 1;
+  }
+  table.logs tbody td { padding: 7px 12px; border-bottom: 1px solid #f0f3f8; vertical-align: top; }
+  table.logs tbody tr:hover { background: #f8fafd; }
+  td.ts { white-space: nowrap; font-family: Consolas, monospace; color: var(--muted); }
+  td.cat { white-space: nowrap; }
+  .lvl { display: inline-block; padding: 1px 8px; border-radius: 5px; font-size: 11px; font-weight: 700; }
+  .lvl.INFO { background: #e8f0fe; color: #2563c9; }
+  .lvl.WARN { background: var(--amber-bg); color: var(--amber); }
+  .lvl.ERROR { background: var(--red-bg); color: var(--red); }
+  .empty-tip { text-align: center; color: var(--muted); padding: 60px 0; font-size: 13px; }
+
+  /* ---------- 提示条 ---------- */
+  .banner {
+    display: none; align-items: center; gap: 10px; padding: 12px 16px; border-radius: 10px;
+    background: var(--amber-bg); border: 1px solid #f3ddb5; color: #92600a; margin-bottom: 16px; font-size: 13px;
+  }
+  .banner.show { display: flex; }
+  .banner .btn { margin-left: auto; }
+
+  /* ---------- Toast ---------- */
+  #toasts { position: fixed; right: 18px; bottom: 18px; display: flex; flex-direction: column; gap: 8px; z-index: 999; }
+  .toast {
+    background: #1f2d3d; color: #fff; padding: 10px 16px; border-radius: 10px; font-size: 13px;
+    box-shadow: 0 6px 20px rgba(0,0,0,.25); display: flex; align-items: center; gap: 8px;
+    animation: slidein .25s ease; max-width: 440px; white-space: pre-line;
+  }
+  .toast.success { background: #0f7a38; }
+  .toast.error { background: #b91c1c; }
+  @keyframes slidein { from { opacity: 0; transform: translateX(30px); } to { opacity: 1; transform: none; } }
+
+  /* ---------- 确认弹窗 ---------- */
+  .modal-mask { display: none; position: fixed; inset: 0; background: rgba(15,23,42,.45); z-index: 1000; align-items: center; justify-content: center; }
+  .modal-mask.show { display: flex; }
+  .modal {
+    background: #fff; border-radius: 14px; padding: 22px 24px; width: min(400px, calc(100vw - 48px));
+    box-shadow: 0 20px 50px rgba(0,0,0,.3);
+  }
+  .modal h4 { font-size: 15px; margin-bottom: 10px; }
+  .modal p { font-size: 13px; color: var(--muted); line-height: 1.6; margin-bottom: 18px; }
+  .modal .m-btns { display: flex; justify-content: flex-end; gap: 10px; }
+
+  /* ---------- 响应式 ---------- */
+  @media (max-width: 760px) {
+    .topbar { padding: 0 14px; }
+    .topbar .sub { display: none; }
+    .top-pills .pill:nth-child(1) { display: none; }
+    nav.tabs { padding: 0 6px; }
+    nav.tabs button { padding: 12px 12px; font-size: 13px; }
+    main { padding: 12px 12px 20px; }
+    .form-row label { width: 100%; }
+    .kv { grid-template-columns: 1fr; }
+    .rule-brief .rb-note { display: none; }
+  }
+</style>
+</head>
+<body>
+<div id="app">
+
+  <!-- 顶栏 -->
+  <header class="topbar">
+    <div class="logo"></div>
+    <div>
+      <h1>掌上看家联动 IP 在线状态监控</h1>
+      <div class="sub">IP Linkage Monitor v1.2.0</div>
+    </div>
+    <div class="spacer"></div>
+    <div class="top-pills">
+      <div class="pill" id="pillMonitor"><span class="dot"></span><span id="pillMonitorText">监控线程</span></div>
+      <div class="pill" id="pillIp"><span class="dot"></span><span id="pillIpText">IP 状态</span></div>
+      <div class="pill" id="pillProg"><span class="dot"></span><span id="pillProgText">监控程序</span></div>
+    </div>
+    <div class="save-indicator" id="saveIndicator">✓ 已保存</div>
+  </header>
+
+  <!-- 导航 -->
+  <nav class="tabs">
+    <button data-tab="console" class="active">🖥️ 控制台</button>
+    <button data-tab="logs">📋 运行日志</button>
+    <button data-tab="settings">⚙️ 设置</button>
+  </nav>
+
+  <main>
+    <!-- ============ 控制台 ============ -->
+    <section class="tab-panel active" id="tab-console">
+      <div class="banner" id="setupBanner">
+        ⚠️ 尚未配置监控程序路径，程序控制类规则无法执行。
+        <button class="btn sm primary" id="btnGoSettings">去设置</button>
+      </div>
+
+      <div class="grid">
+        <!-- IP 状态 -->
+        <div class="card">
+          <h3><span class="icon">📡</span>IP 在线状态<span class="hint" id="ipPollHint"></span></h3>
+          <div class="ip-hero">
+            <div class="ring" id="ipRing"><div class="core"></div></div>
+            <div class="info">
+              <div class="state-word" id="ipStateWord">检测中…</div>
+              <div class="ip" id="ipAddrText">-</div>
+            </div>
+          </div>
+          <div class="kv">
+            <div class="item"><div class="k">响应延迟</div><div class="v" id="ipLatency">-</div></div>
+            <div class="item"><div class="k">上次检测</div><div class="v" id="ipLastCheck">-</div></div>
+            <div class="item" style="grid-column: 1 / -1"><div class="k">上次状态变化</div><div class="v" id="ipLastChange">-</div></div>
+          </div>
+          <div class="btn-row">
+            <button class="btn" id="btnTestNow">🔍 立即检测</button>
+          </div>
+        </div>
+
+        <!-- 联动控制 -->
+        <div class="card">
+          <h3>
+            <span class="icon">🔗</span>联动控制
+            <span class="hint" id="ruleCountHint"></span>
+          </h3>
+          <div class="switch-row">
+            <label class="switch">
+              <input type="checkbox" id="linkageSwitch" />
+              <span class="track"></span><span class="thumb"></span>
+            </label>
+            <div class="desc">开启后按下方规则自动联动执行</div>
+          </div>
+          <div id="ruleBriefList"></div>
+          <div id="pendingList"></div>
+          <div class="btn-row" id="pendingActionsRow" style="display:none">
+            <button class="btn sm danger" id="btnCancelAll">取消全部待执行任务</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 监控程序控制 -->
+      <div class="card">
+        <h3>
+          <span class="icon">🎥</span>监控程序（掌上看家采集端）
+          <span class="badge stopped" id="progBadge">● 未运行</span>
+          <span class="hint" id="progPathView" style="font-family:Consolas,monospace"></span>
+        </h3>
+        <div class="btn-row" style="margin-top:4px">
+          <button class="btn success" id="btnStart">▶ 立即启动</button>
+          <button class="btn danger" id="btnStop">⏹ 彻底关闭</button>
+          <span style="width:12px"></span>
+          <button class="btn" id="btnShowWin">👁 显示窗口</button>
+          <button class="btn" id="btnHideWin">🙈 隐藏窗口</button>
+        </div>
+        <div class="form-note" style="margin-top:10px">
+          「彻底关闭」会同时结束同目录守护进程并防自动重启；启动方式由设置中的「后台运行」选项决定。
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 日志 ============ -->
+    <section class="tab-panel" id="tab-logs">
+      <div class="card">
+        <h3><span class="icon">📋</span>运行日志</h3>
+        <div class="log-toolbar">
+          <input type="date" id="logDate" title="按日期筛选（清空表示全部）" />
+          <button class="btn sm" id="btnToday" title="只看今天">今天</button>
+          <div class="sep"></div>
+          <div class="chk-group" id="levelGroup">
+            级别：
+            <label><input type="checkbox" class="chk-level" value="INFO" checked />INFO</label>
+            <label><input type="checkbox" class="chk-level" value="WARN" checked />WARN</label>
+            <label><input type="checkbox" class="chk-level" value="ERROR" checked />ERROR</label>
+          </div>
+          <div class="sep"></div>
+          <div class="chk-group" id="catGroup">
+            类别：
+            <label><input type="checkbox" class="chk-cat" value="系统" checked />系统</label>
+            <label><input type="checkbox" class="chk-cat" value="监控" checked />监控</label>
+            <label><input type="checkbox" class="chk-cat" value="操作" checked />操作</label>
+            <label><input type="checkbox" class="chk-cat" value="配置" checked />配置</label>
+          </div>
+          <div class="sep"></div>
+          <input type="text" id="logKeyword" placeholder="🔍 关键词…" style="width:150px" />
+          <label class="chk-group" style="cursor:pointer"><input type="checkbox" id="chkAuto" checked />实时刷新</label>
+        </div>
+        <div class="log-toolbar" style="margin-bottom:0">
+          <button class="btn primary sm" id="btnQuery">查询</button>
+          <button class="btn sm" id="btnExport">📤 导出 CSV</button>
+          <button class="btn danger sm" id="btnClear">🗑 清空日志</button>
+          <span class="log-count" id="logCount"></span>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="logs">
+          <thead><tr><th style="width:170px">时间</th><th style="width:70px">级别</th><th style="width:70px">类别</th><th>内容</th></tr></thead>
+          <tbody id="logBody"></tbody>
+        </table>
+        <div class="empty-tip" id="logEmpty">暂无日志</div>
+      </div>
+    </section>
+
+    <!-- ============ 设置 ============ -->
+    <section class="tab-panel" id="tab-settings">
+      <div class="card">
+        <h3><span class="icon">📂</span>监控程序路径</h3>
+        <div class="form-row">
+          <label>程序位置</label>
+          <div class="control">
+            <input type="text" class="path-input mono" id="setPath" placeholder="选择监控程序 exe 文件…" readonly />
+            <span class="validity" id="pathValidity"></span>
+          </div>
+        </div>
+        <div class="form-row" style="margin-bottom:0">
+          <label></label>
+          <div class="control">
+            <button class="btn primary sm" id="btnRegRead">🗂 从注册表读取</button>
+            <button class="btn sm" id="btnBrowse">📄 浏览…</button>
+          </div>
+        </div>
+        <div class="form-note" style="margin-left:140px">
+          默认从注册表读取掌上看家采集端的安装位置；也可手动选择任意 exe 程序。
+        </div>
+      </div>
+
+      <div class="card">
+        <h3><span class="icon">🌐</span>IP 监控设置</h3>
+        <div class="form-row">
+          <label>监控 IP 地址</label>
+          <div class="control">
+            <input type="text" class="mono" id="setIp" placeholder="例如 172.30.109.238" style="width:200px" />
+            <button class="btn sm" id="btnIpTest">🔌 测试连通性</button>
+            <span class="inline-result" id="ipTestResult"></span>
+          </div>
+        </div>
+        <details class="adv">
+          <summary>高级选项</summary>
+          <div class="form-row">
+            <label>检测间隔</label>
+            <div class="control">
+              <select id="selPoll">
+                <option value="1">1 秒</option><option value="2">2 秒</option>
+                <option value="3">3 秒</option><option value="5">5 秒</option>
+                <option value="10">10 秒</option><option value="30">30 秒</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-row">
+            <label>Ping 超时</label>
+            <div class="control">
+              <select id="selTimeout">
+                <option value="1000">1 秒</option><option value="2000">2 秒</option>
+                <option value="3000">3 秒</option><option value="5000">5 秒</option>
+              </select>
+            </div>
+          </div>
+        </details>
+      </div>
+
+      <div class="card">
+        <h3>
+          <span class="icon">🔗</span>联动规则
+          <span class="hint">每条规则独立即时保存；同一状态变化可并行触发多条</span>
+        </h3>
+        <div id="rulesList"></div>
+        <div class="rules-toolbar">
+          <button class="btn primary sm" id="btnAddRule">＋ 新增规则</button>
+          <button class="btn sm" id="btnResetRules">↺ 恢复默认规则</button>
+        </div>
+        <div class="form-note" style="margin-top:10px">
+          提示：动作「执行脚本/程序」支持 .bat / .cmd / .ps1 / .exe，自动选择宿主运行；
+          规则的每次修改都会即时保存到配置文件；状态反转时，与当前状态不符的待执行任务自动作废。
+        </div>
+      </div>
+
+      <div class="card">
+        <h3><span class="icon">🧰</span>通用设置</h3>
+        <div class="form-row">
+          <label>配置文件</label>
+          <div class="control">
+            <input type="text" class="mono" id="cfgPathView" readonly style="flex:1; min-width:260px" placeholder="…" />
+          </div>
+        </div>
+        <div class="form-row">
+          <label></label>
+          <div class="control">
+            <button class="btn sm" id="btnExportCfg">📤 导出配置</button>
+            <button class="btn sm" id="btnImportCfg">📥 导入配置</button>
+            <span class="form-note" style="margin:0">导出包含全部设置与联动规则，可备份或迁移到其他电脑</span>
+          </div>
+        </div>
+        <div class="form-row" style="margin-bottom:0">
+          <label>托盘与关闭</label>
+          <div class="control">
+            <label class="switch">
+              <input type="checkbox" id="chkTray" />
+              <span class="track"></span><span class="thumb"></span>
+            </label>
+            <span class="form-note" style="margin:0">关闭主窗口时最小化到托盘，程序在后台继续运行<br />取消勾选则关闭窗口即退出程序</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3><span class="icon">🪟</span>窗口显示</h3>
+        <div class="switch-row">
+          <label class="switch">
+            <input type="checkbox" id="chkHidden" />
+            <span class="track"></span><span class="thumb"></span>
+          </label>
+          <div class="desc">启动监控程序时以后台方式运行，不显示窗口<br />关闭后，启动时正常显示程序窗口（控制台可随时显示/隐藏）</div>
+        </div>
+      </div>
+
+      <!-- 保存栏 -->
+      <div class="savebar">
+        <span id="saveState" class="clean">✓ 所有更改已保存</span>
+        <button class="btn primary sm" id="btnSaveNow">💾 保存配置</button>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="toasts"></div>
+
+<div class="modal-mask" id="confirmMask">
+  <div class="modal">
+    <h4 id="confirmTitle">确认操作</h4>
+    <p id="confirmMsg"></p>
+    <div class="m-btns">
+      <button class="btn" id="confirmNo">取消</button>
+      <button class="btn danger" id="confirmYes">确认</button>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+const { invoke } = window.__TAURI__.core;
+const { listen } = window.__TAURI__.event;
+
+let cfg = null;
+
+const TRIGGER_LABEL = { online: "IP 上线", offline: "IP 离线" };
+const ACTION_TYPES = [
+  { v: "start_program", label: "▶ 启动监控程序" },
+  { v: "stop_program", label: "⏹ 彻底关闭监控程序" },
+  { v: "show_window", label: "👁 显示监控程序窗口" },
+  { v: "hide_window", label: "🙈 隐藏监控程序窗口" },
+  { v: "run_command", label: "⚙ 执行脚本/程序（自定义）" },
+];
+const DELAY_CHIPS = [0, 10, 30, 60, 180, 600];
+
+/* ===================== 通用工具 ===================== */
+const $ = (id) => document.getElementById(id);
+
+function toast(msg, type = "", ms = 3000) {
+  const el = document.createElement("div");
+  el.className = "toast " + type;
+  el.textContent = msg;
+  $("toasts").appendChild(el);
+  setTimeout(() => { el.style.opacity = "0"; el.style.transition = "opacity .3s"; }, ms - 300);
+  setTimeout(() => el.remove(), ms);
+}
+
+function confirmBox(msg, title = "确认操作") {
+  return new Promise((resolve) => {
+    $("confirmTitle").textContent = title;
+    $("confirmMsg").textContent = msg;
+    $("confirmMask").classList.add("show");
+    const done = (v) => {
+      $("confirmMask").classList.remove("show");
+      $("confirmYes").onclick = $("confirmNo").onclick = null;
+      resolve(v);
+    };
+    $("confirmYes").onclick = () => done(true);
+    $("confirmNo").onclick = () => done(false);
+  });
+}
+
+function fmtSec(s) {
+  if (s === 0) return "立即";
+  if (s < 60) return s + " 秒";
+  if (s % 60 === 0) return (s / 60) + " 分钟";
+  return Math.floor(s / 60) + " 分 " + (s % 60) + " 秒";
+}
+
+function actionLabel(a) {
+  const t = ACTION_TYPES.find(x => x.v === a.type);
+  return t ? t.label.replace(/^[^\s]+\s/, "") : a.type;
+}
+
+/* ===================== 保存机制 =====================
+   - 规则：逐条原子命令，即时保存（不再整份覆盖）
+   - 基础设置：串行保存队列 + 脏标记；保存期间的新修改会排队重发，绝不丢失 */
+let saving = false, dirty = false, lastSavedTs = null;
+
+function updateSaveUI() {
+  const el = $("saveState");
+  if (dirty) { el.textContent = "● 有未保存更改"; el.className = "dirty"; }
+  else { el.textContent = lastSavedTs ? "✓ 已保存 " + lastSavedTs : "✓ 所有更改已保存"; el.className = "clean"; }
+}
+
+function scheduleSave() {
+  dirty = true;
+  updateSaveUI();
+  pump();
+}
+
+async function pump() {
+  if (saving) return;
+  saving = true;
+  while (dirty) {
+    dirty = false;
+    try {
+      await invoke("set_config", { config: cfg });
+      lastSavedTs = new Date().toTimeString().slice(0, 8);
+    } catch (e) {
+      dirty = true; // 保留待保存状态，下次操作或点保存按钮时重试
+      toast("保存失败：" + e, "error", 6000);
+      break;
+    }
+  }
+  saving = false;
+  updateSaveUI();
+}
+
+function savedFlash() {
+  const el = $("saveIndicator");
+  el.textContent = "✓ 已保存";
+  el.classList.add("show");
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.classList.remove("show"), 2000);
+  updateSaveUI();
+}
+
+/* 规则命令串行队列：避免并发响应乱序覆盖 */
+let opQueue = Promise.resolve();
+function queued(fn) {
+  const p = opQueue.then(fn);
+  opQueue = p.catch(() => {});
+  return p;
+}
+
+async function apiAddRule(payload) { return queued(() => invoke("add_rule", { rule: payload })); }
+async function apiUpdateRule(rule) { return queued(() => invoke("update_rule", { rule })); }
+async function apiDeleteRule(id) { return queued(() => invoke("delete_rule", { id })); }
+async function apiToggleRule(id, enabled) { return queued(() => invoke("toggle_rule", { id, enabled })); }
+async function apiResetRules() { return queued(() => invoke("reset_rules")); }
+
+async function resync() {
+  try { cfg = await invoke("get_config"); renderSettings(); renderRuleBriefs(); } catch (_) {}
+}
+
+/* ===================== 导航 ===================== */
+document.querySelectorAll("nav.tabs button").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll("nav.tabs button").forEach(b => b.classList.remove("active"));
+    document.querySelectorAll(".tab-panel").forEach(p => p.classList.remove("active"));
+    btn.classList.add("active");
+    $("tab-" + btn.dataset.tab).classList.add("active");
+    if (btn.dataset.tab === "logs") queryLogs();
+    if (btn.dataset.tab === "settings") renderSettings();
+  });
+});
+$("btnGoSettings").addEventListener("click", () => document.querySelector('nav.tabs button[data-tab="settings"]').click());
+
+/* ===================== 设置：基础项渲染 ===================== */
+function renderSettings() {
+  if (!cfg) return;
+  $("setPath").value = cfg.program_path || "";
+  $("setIp").value = cfg.monitor_ip || "";
+  $("selPoll").value = String(cfg.poll_interval_sec);
+  $("selTimeout").value = String(cfg.ping_timeout_ms);
+  $("chkHidden").checked = !!cfg.launch_hidden;
+  $("chkTray").checked = cfg.close_to_tray !== false;
+  renderRules();
+}
+
+function renderStatusHints() {
+  if (!cfg) return;
+  $("ipAddrText").textContent = cfg.monitor_ip || "（未配置 IP）";
+  $("ipPollHint").textContent = "每 " + cfg.poll_interval_sec + " 秒自动检测";
+  const needPath = cfg.rules.some(r => r.enabled && r.action.type !== "run_command");
+  $("setupBanner").classList.toggle("show", needPath && !cfg.program_path);
+  $("progPathView").textContent = cfg.program_path ? cfg.program_path : "";
+  const enable = !!cfg.program_path;
+  ["btnStart", "btnStop", "btnShowWin", "btnHideWin"].forEach(id => $(id).disabled = !enable);
+  renderRuleBriefs();
+}
+
+/* ===================== 联动规则编辑器 ===================== */
+function renderRules() {
+  const box = $("rulesList");
+  box.innerHTML = "";
+  if (!cfg.rules.length) {
+    box.innerHTML = '<div class="empty-tip" style="padding:24px 0">暂无规则，点击「新增规则」或「恢复默认规则」</div>';
+    return;
+  }
+  for (const rule of cfg.rules) {
+    box.appendChild(buildRuleCard(rule));
+  }
+}
+
+/* 单条规则修改提交（即时保存） */
+async function commitRule(rule, { rerender = false } = {}) {
+  try {
+    cfg = await apiUpdateRule(rule);
+    savedFlash();
+    renderRuleBriefs();
+    renderStatusHints();
+    if (rerender) renderRules();
+  } catch (e) {
+    toast("保存规则失败：" + e, "error", 6000);
+    await resync();
+  }
+}
+
+function buildRuleCard(rule) {
+  const el = document.createElement("div");
+  el.className = "rule-card" + (rule.enabled ? "" : " disabled");
+
+  /* 头部：启用开关 + 备注 + 操作按钮 */
+  const head = document.createElement("div");
+  head.className = "rule-head";
+
+  const sw = document.createElement("label");
+  sw.className = "switch sm";
+  sw.title = rule.enabled ? "已启用" : "已停用";
+  sw.innerHTML = `<input type="checkbox" ${rule.enabled ? "checked" : ""}/><span class="track"></span><span class="thumb"></span>`;
+  sw.querySelector("input").addEventListener("change", async (e) => {
+    const enabled = e.target.checked;
+    try {
+      cfg = await apiToggleRule(rule.id, enabled);
+      savedFlash();
+      renderRules();
+      renderRuleBriefs();
+      renderStatusHints();
+    } catch (err) {
+      toast("操作失败：" + err, "error", 5000);
+      e.target.checked = !enabled;
+      await resync();
+    }
+  });
+
+  const rid = document.createElement("span");
+  rid.className = "rid";
+  rid.textContent = "#" + rule.id;
+
+  const note = document.createElement("input");
+  note.type = "text";
+  note.className = "note";
+  note.placeholder = "规则备注（例如：白天上班关采集端）";
+  note.value = rule.note;
+  note.addEventListener("change", () => { rule.note = note.value.trim(); commitRule(rule); });
+
+  const btnRun = document.createElement("button");
+  btnRun.className = "btn xs";
+  btnRun.textContent = "▶ 试运行";
+  btnRun.title = "立即执行一次该规则的动作（使用当前界面上的动作配置）";
+  btnRun.addEventListener("click", async () => {
+    btnRun.disabled = true;
+    try {
+      const msg = await invoke("run_action", { action: rule.action, note: rule.note || actionLabel(rule.action) });
+      toast(msg, "success", 4500);
+    } catch (e) { toast("试运行失败：" + e, "error", 6000); }
+    btnRun.disabled = false;
+  });
+
+  const btnDel = document.createElement("button");
+  btnDel.className = "btn xs danger";
+  btnDel.textContent = "🗑 删除";
+  btnDel.addEventListener("click", async () => {
+    const title = rule.note || actionLabel(rule.action);
+    if (!(await confirmBox(`确定删除规则「${title}」吗？`, "删除规则"))) return;
+    try {
+      cfg = await apiDeleteRule(rule.id);
+      savedFlash();
+      renderRules();
+      renderRuleBriefs();
+      renderStatusHints();
+      toast("规则已删除", "success");
+    } catch (e) { toast("删除失败：" + e, "error", 5000); }
+  });
+
+  head.append(sw, rid, note, btnRun, btnDel);
+
+  /* 主体：触发 + 延迟 + 动作 */
+  const body = document.createElement("div");
+  body.className = "rule-body";
+
+  const fTrig = document.createElement("span");
+  fTrig.className = "field";
+  fTrig.innerHTML = "当";
+  const selTrig = document.createElement("select");
+  selTrig.innerHTML = `<option value="online">IP 上线</option><option value="offline">IP 离线</option>`;
+  selTrig.value = rule.trigger;
+  selTrig.addEventListener("change", () => { rule.trigger = selTrig.value; commitRule(rule); });
+  fTrig.append(selTrig);
+
+  const fDelay = document.createElement("span");
+  fDelay.className = "field";
+  fDelay.textContent = "后";
+  const inpDelay = document.createElement("input");
+  inpDelay.type = "number";
+  inpDelay.min = "0"; inpDelay.max = "86400";
+  inpDelay.value = rule.delay_sec;
+  inpDelay.title = "延迟秒数，0 = 立即执行";
+  inpDelay.addEventListener("change", () => {
+    const v = parseInt(inpDelay.value, 10);
+    if (isNaN(v) || v < 0 || v > 86400) { toast("请输入 0 ~ 86400 之间的秒数", "error"); inpDelay.value = rule.delay_sec; return; }
+    rule.delay_sec = v;
+    commitRule(rule);
+    markChips();
+  });
+  fDelay.append(inpDelay, document.createTextNode("秒"));
+
+  const fChips = document.createElement("span");
+  fChips.className = "field";
+  function markChips() {
+    fChips.querySelectorAll(".chip").forEach(c => c.classList.toggle("active", +c.dataset.v === rule.delay_sec));
+  }
+  for (const d of DELAY_CHIPS) {
+    const c = document.createElement("button");
+    c.className = "chip";
+    c.dataset.v = d;
+    c.textContent = fmtSec(d);
+    c.addEventListener("click", () => {
+      rule.delay_sec = d;
+      inpDelay.value = d;
+      commitRule(rule);
+      markChips();
+    });
+    fChips.appendChild(c);
+  }
+  markChips();
+
+  const fAct = document.createElement("span");
+  fAct.className = "field";
+  const selAct = document.createElement("select");
+  selAct.style.minWidth = "200px";
+  for (const t of ACTION_TYPES) {
+    const o = document.createElement("option");
+    o.value = t.v; o.textContent = t.label;
+    selAct.appendChild(o);
+  }
+  selAct.value = rule.action.type;
+  selAct.addEventListener("change", () => {
+    rule.action.type = selAct.value;
+    commitRule(rule, { rerender: true });
+  });
+  fAct.append(document.createTextNode("执行"), selAct);
+
+  body.append(fTrig, fDelay, fChips, fAct);
+
+  /* 自定义动作子表单 */
+  if (rule.action.type === "run_command") {
+    const sub = document.createElement("div");
+    sub.className = "run-subform";
+
+    const inpPath = document.createElement("input");
+    inpPath.type = "text";
+    inpPath.className = "mono";
+    inpPath.placeholder = "脚本或程序路径（.bat / .cmd / .ps1 / .exe）";
+    inpPath.value = rule.action.path;
+    inpPath.addEventListener("change", () => { rule.action.path = inpPath.value.trim(); commitRule(rule); });
+
+    const btnPick = document.createElement("button");
+    btnPick.className = "btn xs";
+    btnPick.textContent = "📄 选择";
+    btnPick.addEventListener("click", async () => {
+      const p = await invoke("browse_program_path");
+      if (p) { rule.action.path = p; inpPath.value = p; commitRule(rule); }
+    });
+
+    const inpArgs = document.createElement("input");
+    inpArgs.type = "text";
+    inpArgs.className = "args mono";
+    inpArgs.placeholder = "参数（可空，支持引号）";
+    inpArgs.value = rule.action.args;
+    inpArgs.addEventListener("change", () => { rule.action.args = inpArgs.value; commitRule(rule); });
+
+    const chkHid = document.createElement("label");
+    chkHid.className = "chk";
+    chkHid.innerHTML = `<input type="checkbox" ${rule.action.hidden ? "checked" : ""}/>隐藏窗口运行`;
+    chkHid.querySelector("input").addEventListener("change", (e) => { rule.action.hidden = e.target.checked; commitRule(rule); });
+
+    sub.append(inpPath, btnPick, inpArgs, chkHid);
+    body.appendChild(sub);
+  }
+
+  el.append(head, body);
+  return el;
+}
+
+$("btnAddRule").addEventListener("click", async () => {
+  try {
+    cfg = await apiAddRule({
+      id: 0, // 由后端分配
+      enabled: true,
+      trigger: "online",
+      delay_sec: 10,
+      action: { type: "start_program", path: "", args: "", hidden: true },
+      note: "",
+    });
+    savedFlash();
+    renderRules();
+    renderRuleBriefs();
+    renderStatusHints();
+    const cards = document.querySelectorAll(".rule-card");
+    if (cards.length) cards[cards.length - 1].scrollIntoView({ behavior: "smooth", block: "center" });
+  } catch (e) { toast("新增规则失败：" + e, "error", 5000); }
+});
+
+$("btnResetRules").addEventListener("click", async () => {
+  if (!(await confirmBox("将用默认规则（上线 10 秒后彻底关闭、离线 10 秒后启动）替换当前全部规则，确定吗？", "恢复默认规则"))) return;
+  try {
+    cfg = await apiResetRules();
+    savedFlash();
+    renderRules();
+    renderRuleBriefs();
+    renderStatusHints();
+    toast("已恢复默认规则", "success");
+  } catch (e) { toast("操作失败：" + e, "error", 5000); }
+});
+
+/* ===================== 控制台：规则摘要与待执行任务 ===================== */
+function renderRuleBriefs() {
+  if (!cfg) return;
+  const box = $("ruleBriefList");
+  box.innerHTML = "";
+  const enabled = cfg.rules.filter(r => r.enabled);
+  $("ruleCountHint").textContent = cfg.linkage_enabled
+    ? `已启用 ${enabled.length}/${cfg.rules.length} 条规则`
+    : `共 ${cfg.rules.length} 条规则（总开关未开启）`;
+  if (!cfg.rules.length) {
+    box.innerHTML = '<div class="form-note" style="margin-top:10px">尚未配置任何规则，请到「设置 → 联动规则」添加。</div>';
+    return;
+  }
+  for (const r of cfg.rules) {
+    const row = document.createElement("div");
+    row.className = "rule-brief" + (r.enabled ? "" : " disabled");
+    const trigTag = `<span class="tag ${r.trigger === "online" ? "online" : "offline"}">${TRIGGER_LABEL[r.trigger]}</span>`;
+    row.innerHTML =
+      `${trigTag} ${r.delay_sec === 0 ? "<b>立即</b>" : "<b>" + fmtSec(r.delay_sec) + "</b>后"} <span class="rb-arrow">→</span> ${actionLabel(r.action)}` +
+      (r.note ? `<span class="rb-note" title="${r.note.replace(/"/g, "&quot;")}">${r.note}</span>` : "");
+    box.appendChild(row);
+  }
+}
+
+function renderPendings(pendings) {
+  const box = $("pendingList");
+  const row = $("pendingActionsRow");
+  box.innerHTML = "";
+  if (!pendings || !pendings.length) {
+    row.style.display = "none";
+    return;
+  }
+  row.style.display = "flex";
+  for (const p of pendings) {
+    const item = document.createElement("div");
+    item.className = "pending-item";
+    const title = p.note || p.actionDesc;
+    item.innerHTML =
+      `<span>⏳</span><span class="p-main"><span class="p-title">${title}</span>` +
+      `<span class="p-sub">${p.actionDesc} · 预定 ${p.dueTs}</span></span>` +
+      `<span class="count">${p.remainingSec}s</span>`;
+    const btnCancel = document.createElement("button");
+    btnCancel.className = "btn xs danger";
+    btnCancel.textContent = "取消";
+    btnCancel.addEventListener("click", async () => {
+      const n = await invoke("cancel_pending", { ruleId: p.ruleId });
+      if (n > 0) { toast("已取消该任务", "success"); refreshStatus(); }
+      else toast("任务可能已执行完毕");
+    });
+    item.appendChild(btnCancel);
+    box.appendChild(item);
+  }
+}
+
+$("btnCancelAll").addEventListener("click", async () => {
+  const n = await invoke("cancel_pending", { ruleId: null });
+  if (n > 0) { toast(`已取消 ${n} 个待执行任务`, "success"); refreshStatus(); }
+  else toast("当前没有待执行任务");
+});
+
+/* ===================== 设置交互 ===================== */
+$("btnRegRead").addEventListener("click", async () => {
+  try {
+    const p = await invoke("read_registry_path");
+    cfg.program_path = p;
+    $("setPath").value = p;
+    scheduleSave();
+    renderStatusHints();
+    toast("已从注册表读取：" + p, "success");
+  } catch (e) {
+    toast("读取注册表失败：" + e, "error", 5000);
+  }
+});
+
+$("btnBrowse").addEventListener("click", async () => {
+  try {
+    const p = await invoke("browse_program_path");
+    if (p) {
+      cfg.program_path = p;
+      $("setPath").value = p;
+      scheduleSave();
+      renderStatusHints();
+      toast("已选择监控程序", "success");
+    }
+  } catch (e) { toast("选择文件失败：" + e, "error"); }
+});
+$("setPath").addEventListener("dblclick", () => $("btnBrowse").click());
+
+$("setIp").addEventListener("change", () => {
+  cfg.monitor_ip = $("setIp").value.trim();
+  scheduleSave();
+  renderStatusHints();
+});
+
+$("btnIpTest").addEventListener("click", async () => {
+  const ip = $("setIp").value.trim();
+  const el = $("ipTestResult");
+  if (!ip) { el.className = "inline-result offline"; el.textContent = "请输入 IP"; return; }
+  el.className = "inline-result"; el.textContent = "检测中…";
+  const t0 = performance.now();
+  try {
+    const r = await invoke("test_ip", { ip, timeoutMs: cfg.ping_timeout_ms });
+    const ms = Math.round(performance.now() - t0);
+    if (r.online) { el.className = "inline-result online"; el.textContent = `● 在线（${ms} ms）`; }
+    else { el.className = "inline-result offline"; el.textContent = `○ 离线（${ms} ms）`; }
+  } catch (e) {
+    el.className = "inline-result offline"; el.textContent = e;
+  }
+});
+
+$("selPoll").addEventListener("change", () => { cfg.poll_interval_sec = +$("selPoll").value; scheduleSave(); renderStatusHints(); });
+$("selTimeout").addEventListener("change", () => { cfg.ping_timeout_ms = +$("selTimeout").value; scheduleSave(); });
+$("chkHidden").addEventListener("change", () => { cfg.launch_hidden = $("chkHidden").checked; scheduleSave(); });
+$("chkTray").addEventListener("change", () => { cfg.close_to_tray = $("chkTray").checked; scheduleSave(); });
+
+$("btnSaveNow").addEventListener("click", () => { dirty = true; updateSaveUI(); pump(); });
+
+/* 导入 / 导出配置 */
+$("btnExportCfg").addEventListener("click", async () => {
+  try {
+    const r = await invoke("export_config");
+    if (r) toast("配置已导出到：\n" + r, "success", 6000);
+  } catch (e) {
+    if (e !== "已取消导出") toast("导出失败：" + e, "error", 6000);
+  }
+});
+
+$("btnImportCfg").addEventListener("click", async () => {
+  if (!(await confirmBox("导入将覆盖当前全部设置与联动规则（待执行任务会取消），确定继续吗？", "导入配置"))) return;
+  try {
+    const c = await invoke("import_config");
+    if (c) {
+      cfg = c;
+      renderSettings();
+      renderStatusHints();
+      renderRuleBriefs();
+      toast("配置导入成功", "success");
+    }
+  } catch (e) {
+    if (e !== "已取消导入") toast("导入失败：" + e, "error", 6000);
+  }
+});
+
+/* ===================== 控制台交互 ===================== */
+$("linkageSwitch").addEventListener("change", () => {
+  cfg.linkage_enabled = $("linkageSwitch").checked;
+  scheduleSave();
+  renderRuleBriefs();
+});
+
+$("btnTestNow").addEventListener("click", async () => {
+  const el = $("ipStateWord");
+  el.textContent = "检测中…"; el.className = "state-word";
+  const t0 = performance.now();
+  try {
+    const r = await invoke("test_ip", { ip: cfg.monitor_ip || "127.0.0.1", timeoutMs: cfg.ping_timeout_ms });
+    const ms = Math.round(performance.now() - t0);
+    applyIpView(r.online, ms, "刚刚");
+  } catch (e) { toast(e, "error"); }
+  setTimeout(refreshStatus, 500);
+});
+
+$("btnStart").addEventListener("click", async () => {
+  toast("正在启动监控程序…");
+  try { await invoke("manual_start"); } catch (e) { toast("启动失败：" + e, "error", 5000); }
+  setTimeout(refreshStatus, 1200);
+});
+$("btnStop").addEventListener("click", async () => {
+  const ok = await confirmBox("确定要彻底关闭监控程序吗？会同时结束其守护进程，未保存的数据可能丢失。", "彻底关闭监控程序");
+  if (!ok) return;
+  toast("正在彻底关闭监控程序（含守护进程与防复活验证）…", "", 6000);
+  await invoke("manual_stop");
+  setTimeout(refreshStatus, 1500);
+});
+$("btnShowWin").addEventListener("click", async () => {
+  try {
+    const n = await invoke("show_program_window");
+    if (n > 0) toast("已显示监控程序窗口", "success");
+  } catch (e) { toast(e, "error"); }
+});
+$("btnHideWin").addEventListener("click", async () => {
+  try {
+    const n = await invoke("hide_program_window");
+    if (n === 0) toast("监控程序当前没有可见窗口");
+    else toast("已隐藏监控程序窗口", "success");
+  } catch (e) { toast(e, "error"); }
+});
+
+/* ===================== 状态轮询 ===================== */
+function applyIpView(online, latencyMs, lastCheck) {
+  const ring = $("ipRing"), word = $("ipStateWord");
+  ring.className = "ring " + (online ? "online" : "offline");
+  word.className = "state-word " + (online ? "online" : "offline");
+  word.textContent = online ? "在 线" : "离 线";
+  if (latencyMs != null) $("ipLatency").textContent = latencyMs + " ms";
+  if (lastCheck) $("ipLastCheck").textContent = lastCheck;
+  const pillIp = $("pillIp");
+  pillIp.className = "pill " + (online ? "ok" : "bad");
+  $("pillIpText").textContent = online ? "IP 在线" : "IP 离线";
+}
+
+async function refreshStatus() {
+  try {
+    const s = await invoke("get_status");
+    if (s.ipOnline === null || s.ipOnline === undefined) {
+      $("ipRing").className = "ring";
+      const w = $("ipStateWord"); w.className = "state-word"; w.textContent = "未监测";
+      $("ipLatency").textContent = "-";
+      $("pillIp").className = "pill"; $("pillIpText").textContent = "IP 未配置";
+    } else {
+      applyIpView(s.ipOnline, s.latencyMs, s.ipLastCheck);
+    }
+    $("ipLastChange").textContent = s.lastTransition || "—";
+
+    const pillMon = $("pillMonitor");
+    pillMon.className = "pill " + (s.monitorAlive ? "ok" : "bad");
+    $("pillMonitorText").textContent = s.monitorAlive ? "监控运行中" : "监控异常";
+
+    const pillProg = $("pillProg");
+    pillProg.className = "pill " + (s.programRunning ? "ok" : "");
+    $("pillProgText").textContent = s.programRunning ? "程序运行中" : "程序未运行";
+
+    const badge = $("progBadge");
+    if (s.programRunning) { badge.className = "badge running"; badge.textContent = "● 运行中"; }
+    else { badge.className = "badge stopped"; badge.textContent = "● 未运行"; }
+
+    if (cfg && !s.programPathExists && cfg.program_path) {
+      const v = $("pathValidity"); v.className = "validity bad"; v.textContent = "⚠ 文件不存在";
+    } else {
+      const v = $("pathValidity");
+      if (cfg && cfg.program_path) { v.className = "validity ok"; v.textContent = "✓"; }
+      else { v.className = "validity"; v.textContent = ""; }
+    }
+
+    if (cfg) $("linkageSwitch").checked = cfg.linkage_enabled;
+    renderPendings(s.pendings);
+  } catch (e) { /* 轮询失败静默，下次重试 */ }
+}
+
+/* 托盘切换联动后同步界面 */
+listen("linkage-changed", (ev) => {
+  if (!cfg) return;
+  cfg.linkage_enabled = !!ev.payload;
+  $("linkageSwitch").checked = cfg.linkage_enabled;
+  renderRuleBriefs();
+});
+
+/* ===================== 日志 ===================== */
+function currentFilter() {
+  const levels = [...document.querySelectorAll(".chk-level:checked")].map(c => c.value);
+  const categories = [...document.querySelectorAll(".chk-cat:checked")].map(c => c.value);
+  const date = $("logDate").value || null;
+  const keyword = $("logKeyword").value.trim() || null;
+  return { date, levels, categories, keyword, limit: 2000 };
+}
+
+async function queryLogs() {
+  try {
+    const list = await invoke("get_logs", { filter: currentFilter() });
+    renderLogs(list);
+  } catch (e) { toast("查询日志失败：" + e, "error"); }
+}
+
+function renderLogs(list) {
+  const body = $("logBody");
+  body.innerHTML = "";
+  const frag = document.createDocumentFragment();
+  for (const e of list) {
+    const tr = document.createElement("tr");
+    const tdTs = document.createElement("td"); tdTs.className = "ts"; tdTs.textContent = e.ts;
+    const tdLv = document.createElement("td");
+    tdLv.innerHTML = `<span class="lvl ${e.level}">${e.level}</span>`;
+    const tdCat = document.createElement("td"); tdCat.className = "cat"; tdCat.textContent = e.category;
+    const tdMsg = document.createElement("td"); tdMsg.textContent = e.message;
+    tr.append(tdTs, tdLv, tdCat, tdMsg);
+    frag.appendChild(tr);
+  }
+  body.appendChild(frag);
+  $("logEmpty").style.display = list.length ? "none" : "block";
+  $("logCount").textContent = `共 ${list.length} 条` + (list.length >= 2000 ? "（已达上限）" : "");
+}
+
+function entryMatchesFilter(e, f) {
+  if (f.levels.length && !f.levels.includes(e.level)) return false;
+  if (f.categories.length && !f.categories.includes(e.category)) return false;
+  if (f.keyword && !e.message.toLowerCase().includes(f.keyword.toLowerCase())) return false;
+  return true;
+}
+
+/* 实时日志推送 */
+listen("log-entry", (ev) => {
+  const e = ev.payload;
+  if (!$("chkAuto").checked) return;
+  if (!document.querySelector("#tab-logs.active")) return;
+  const f = currentFilter();
+  if (!entryMatchesFilter(e, f)) return;
+  const body = $("logBody");
+  const tr = document.createElement("tr");
+  const tdTs = document.createElement("td"); tdTs.className = "ts"; tdTs.textContent = e.ts;
+  const tdLv = document.createElement("td");
+  tdLv.innerHTML = `<span class="lvl ${e.level}">${e.level}</span>`;
+  const tdCat = document.createElement("td"); tdCat.className = "cat"; tdCat.textContent = e.category;
+  const tdMsg = document.createElement("td"); tdMsg.textContent = e.message;
+  tr.append(tdTs, tdLv, tdCat, tdMsg);
+  body.prepend(tr);
+  while (body.children.length > 2000) body.lastChild.remove();
+  const m = $("logCount").textContent.match(/\d+/);
+  const n = (m ? +m[0] : 0) + 1;
+  $("logCount").textContent = `共 ${Math.min(n, 2000)} 条`;
+  $("logEmpty").style.display = "none";
+});
+
+$("btnQuery").addEventListener("click", queryLogs);
+$("logKeyword").addEventListener("keydown", (e) => { if (e.key === "Enter") queryLogs(); });
+$("btnToday").addEventListener("click", () => {
+  $("logDate").value = new Date().toISOString().slice(0, 10);
+  queryLogs();
+});
+
+$("btnExport").addEventListener("click", async () => {
+  try {
+    const r = await invoke("export_logs", { filter: currentFilter() });
+    if (r && r.count !== undefined) toast(`已导出 ${r.count} 条日志\n${r.path}`, "success", 6000);
+  } catch (e) {
+    if (e !== "已取消导出") toast("导出失败：" + e, "error");
+  }
+});
+
+$("btnClear").addEventListener("click", async () => {
+  const ok = await confirmBox("将删除全部日志文件（含历史日期），此操作不可恢复。确定继续吗？", "清空日志");
+  if (!ok) return;
+  try {
+    const n = await invoke("clear_logs");
+    toast(`已清空 ${n} 个日志文件`, "success");
+    queryLogs();
+  } catch (e) { toast("清空失败：" + e, "error"); }
+});
+
+/* ===================== 初始化 ===================== */
+(async function init() {
+  try {
+    cfg = await invoke("get_config");
+  } catch (e) {
+    toast("加载配置失败：" + e, "error");
+    cfg = {
+      program_path: "", monitor_ip: "172.30.109.238", linkage_enabled: false,
+      launch_hidden: true, close_to_tray: true, poll_interval_sec: 3, ping_timeout_ms: 2000,
+      rules: [], rules_seeded: true,
+    };
+  }
+  try { $("cfgPathView").value = await invoke("get_config_path"); } catch (_) {}
+  renderSettings();
+  renderStatusHints();
+  updateSaveUI();
+  refreshStatus();
+  setInterval(refreshStatus, 1500);
+  queryLogs();
+})();
+</script>
+</body>
+</html>

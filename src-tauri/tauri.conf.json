@@ -1,0 +1,31 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "IPLinkageMonitor",
+  "version": "1.2.0",
+  "identifier": "com.athome.ipmonitor",
+  "build": {
+    "frontendDist": "../ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "掌上看家联动IP在线状态监控",
+        "width": 1020,
+        "height": 720,
+        "minWidth": 860,
+        "minHeight": 620,
+        "center": true,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": ["icons/icon.ico"]
+  }
+}
