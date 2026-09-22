@@ -1,14 +1,13 @@
 use crate::config::{Config, LinkageRule, RuleAction, ACT_RUN};
 use crate::logger::{self, LogEntry, LogFilter, CAT_CONFIG, CAT_USER, INFO, WARN};
 use crate::monitor;
-use crate::netcheck;
-use crate::process;
-use crate::registry;
+use crate::{bluetooth, netcheck, process, registry};
 use crate::state::AppState;
 use crate::tray::TrayState;
 use chrono::Local;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Instant;
 use tauri::{AppHandle, Manager, State};
 
 fn valid_ipv4(s: &str) -> bool {
@@ -49,6 +48,11 @@ fn validate_and_normalize(cfg: &mut Config) -> Result<(), String> {
     cfg.program_path = cfg.program_path.trim().trim_matches('"').to_string();
     cfg.poll_interval_sec = cfg.poll_interval_sec.clamp(1, 60);
     cfg.ping_timeout_ms = cfg.ping_timeout_ms.clamp(200, 10000);
+    if cfg.monitor_mode != "bluetooth" {
+        cfg.monitor_mode = "ip".to_string();
+    }
+    cfg.bt_device = cfg.bt_device.trim().to_string();
+    cfg.bt_scan_timeout_mult = cfg.bt_scan_timeout_mult.clamp(1, 48);
     let mut seen_ids: HashSet<u32> = HashSet::new();
     for r in &mut cfg.rules {
         if !matches!(r.trigger.as_str(), "online" | "offline") {
@@ -105,6 +109,19 @@ pub fn set_config(
                 "监控 IP {} → {}",
                 if old.monitor_ip.is_empty() { "（空）" } else { &old.monitor_ip },
                 if new_cfg.monitor_ip.is_empty() { "（空）" } else { &new_cfg.monitor_ip }
+            ));
+        }
+        if old.monitor_mode != new_cfg.monitor_mode {
+            changes.push(format!(
+                "监控方式 → {}",
+                if new_cfg.monitor_mode == "bluetooth" { "蓝牙邻近监控" } else { "IP Ping 监控" }
+            ));
+        }
+        if old.bt_device != new_cfg.bt_device {
+            changes.push(format!(
+                "监控蓝牙设备 {} → {}",
+                if old.bt_device.is_empty() { "（空）" } else { &old.bt_device },
+                if new_cfg.bt_device.is_empty() { "（空）" } else { &new_cfg.bt_device }
             ));
         }
         if old.linkage_enabled != new_cfg.linkage_enabled {
@@ -486,6 +503,113 @@ pub async fn run_action(
     tauri::async_runtime::spawn_blocking(move || monitor::execute_action(&st, &action))
         .await
         .map_err(|e| e.to_string())?
+}
+
+/* ===================== 检测测试（IP / 蓝牙） ===================== */
+
+#[derive(serde::Serialize)]
+pub struct MonitorTestResult {
+    pub online: bool,
+    pub latency_ms: u64,
+    pub mode: String,
+}
+
+/// 控制台「立即检测」：按当前监控方式执行一次检测
+#[tauri::command]
+pub async fn test_monitor(state: State<'_, Arc<AppState>>) -> Result<MonitorTestResult, String> {
+    let cfg = state.config_snapshot();
+    if cfg.monitor_mode == "bluetooth" {
+        if cfg.bt_device.trim().is_empty() {
+            return Err("未配置蓝牙设备（名称或 MAC）".into());
+        }
+        let dev = cfg.bt_device.trim().to_string();
+        let mult = cfg.bt_scan_timeout_mult.clamp(1, 48);
+        logger::log(INFO, CAT_USER, &format!("手动立即检测：蓝牙扫描「{dev}」…"));
+        let t0 = Instant::now();
+        let online =
+            tauri::async_runtime::spawn_blocking(move || bluetooth::presence(&dev, mult))
+                .await
+                .map_err(|e| e.to_string())??;
+        let ms = t0.elapsed().as_millis() as u64;
+        logger::log(
+            INFO,
+            CAT_USER,
+            &format!("手动蓝牙检测结果：{}（{ms} ms）", if online { "在线" } else { "未发现" }),
+        );
+        Ok(MonitorTestResult { online, latency_ms: ms, mode: "bluetooth".into() })
+    } else {
+        if cfg.monitor_ip.trim().is_empty() {
+            return Err("未配置监控 IP".into());
+        }
+        let ip = cfg.monitor_ip.trim().to_string();
+        let timeout = cfg.ping_timeout_ms;
+        logger::log(INFO, CAT_USER, &format!("手动立即检测：IP {ip}…"));
+        let t0 = Instant::now();
+        let online = tauri::async_runtime::spawn_blocking(move || netcheck::ping_once(&ip, timeout))
+            .await
+            .map_err(|e| e.to_string())?;
+        let ms = t0.elapsed().as_millis() as u64;
+        Ok(MonitorTestResult { online, latency_ms: ms, mode: "ip".into() })
+    }
+}
+
+#[derive(serde::Serialize)]
+pub struct BtTestResult {
+    pub online: bool,
+    pub device_count: usize,
+    pub duration_ms: u64,
+    pub matched: Option<String>,
+}
+
+/// 设置页「测试蓝牙检测」：扫描并列出是否找到目标
+#[tauri::command]
+pub async fn test_bluetooth(device: String, timeout_mult: u32) -> Result<BtTestResult, String> {
+    let dev = device.trim().to_string();
+    if dev.is_empty() {
+        return Err("请先填写设备名称或 MAC".into());
+    }
+    let mult = timeout_mult.clamp(1, 48);
+    logger::log(INFO, CAT_USER, &format!("测试蓝牙检测：「{dev}」…"));
+    let t0 = Instant::now();
+    let devs = tauri::async_runtime::spawn_blocking(move || bluetooth::inquiry(mult))
+        .await
+        .map_err(|e| e.to_string())??;
+    let duration = t0.elapsed().as_millis() as u64;
+    let matched = devs
+        .iter()
+        .find(|d| bluetooth::device_matches(&d.name, &d.address, &dev));
+    logger::log(
+        INFO,
+        CAT_USER,
+        &format!(
+            "蓝牙检测结果：{}（扫描到 {} 个设备，{duration} ms）",
+            if matched.is_some() { "找到目标" } else { "未找到目标" },
+            devs.len()
+        ),
+    );
+    Ok(BtTestResult {
+        online: matched.is_some(),
+        device_count: devs.len(),
+        duration_ms: duration,
+        matched: matched.map(|d| if d.name.is_empty() { d.address.clone() } else { d.name.clone() }),
+    })
+}
+
+#[derive(serde::Serialize)]
+pub struct BtScanList {
+    pub devices: Vec<bluetooth::BtDevice>,
+    pub duration_ms: u64,
+}
+
+/// 扫描附近蓝牙设备（供前端拾取器选择目标）
+#[tauri::command]
+pub async fn bt_scan_devices(timeout_mult: u32) -> Result<BtScanList, String> {
+    let mult = timeout_mult.clamp(1, 48);
+    let t0 = Instant::now();
+    let devices = tauri::async_runtime::spawn_blocking(move || bluetooth::inquiry(mult))
+        .await
+        .map_err(|e| e.to_string())??;
+    Ok(BtScanList { devices, duration_ms: t0.elapsed().as_millis() as u64 })
 }
 
 /* ===================== 配置文件导入/导出 ===================== */

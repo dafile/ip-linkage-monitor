@@ -236,6 +236,8 @@
   }
   .chip:hover { border-color: var(--primary); color: var(--primary); }
   .chip.active { background: var(--primary); border-color: var(--primary); color: #fff; }
+  .mode-seg { display: inline-flex; gap: 8px; flex-wrap: wrap; }
+  .mode-seg .chip { padding: 6px 16px; font-size: 12.5px; }
   .run-subform {
     display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px;
     padding: 10px 12px; background: #f1f5fb; border-radius: 9px; width: 100%;
@@ -331,7 +333,7 @@
     <div class="logo"></div>
     <div>
       <h1>掌上看家联动 IP 在线状态监控</h1>
-      <div class="sub">IP Linkage Monitor v1.2.0</div>
+      <div class="sub">IP Linkage Monitor v1.3.0</div>
     </div>
     <div class="spacer"></div>
     <div class="top-pills">
@@ -360,7 +362,7 @@
       <div class="grid">
         <!-- IP 状态 -->
         <div class="card">
-          <h3><span class="icon">📡</span>IP 在线状态<span class="hint" id="ipPollHint"></span></h3>
+          <h3><span class="icon">📡</span>在线状态<span class="hint" id="ipPollHint"></span></h3>
           <div class="ip-hero">
             <div class="ring" id="ipRing"><div class="core"></div></div>
             <div class="info">
@@ -485,13 +487,47 @@
       </div>
 
       <div class="card">
-        <h3><span class="icon">🌐</span>IP 监控设置</h3>
+        <h3><span class="icon">🌐</span>监控设置 <span class="hint">IP 与蓝牙二选一，作为联动的状态来源</span></h3>
         <div class="form-row">
-          <label>监控 IP 地址</label>
+          <label>监控方式</label>
           <div class="control">
-            <input type="text" class="mono" id="setIp" placeholder="例如 172.30.109.238" style="width:200px" />
-            <button class="btn sm" id="btnIpTest">🔌 测试连通性</button>
-            <span class="inline-result" id="ipTestResult"></span>
+            <div class="mode-seg">
+              <button type="button" class="chip" id="modeIp">📡 IP Ping 监控</button>
+              <button type="button" class="chip" id="modeBt">🔵 蓝牙邻近监控</button>
+            </div>
+          </div>
+        </div>
+        <div id="ipFields">
+          <div class="form-row">
+            <label>监控 IP 地址</label>
+            <div class="control">
+              <input type="text" class="mono" id="setIp" placeholder="例如 172.30.109.238" style="width:200px" />
+              <button class="btn sm" id="btnIpTest">🔌 测试连通性</button>
+              <span class="inline-result" id="ipTestResult"></span>
+            </div>
+          </div>
+        </div>
+        <div id="btFields" style="display:none">
+          <div class="form-row">
+            <label>蓝牙设备</label>
+            <div class="control">
+              <input type="text" class="mono" id="setBtDevice" placeholder="设备名称或 MAC，如 Xiaomi 14 或 A4:C1:38:11:22:33" style="flex:1; min-width:260px" />
+              <button class="btn sm" id="btnBtScan">🔍 扫描拾取</button>
+            </div>
+          </div>
+          <div class="form-row">
+            <label></label>
+            <div class="control">
+              <button class="btn sm" id="btnBtTest">🔌 测试蓝牙检测</button>
+              <span class="inline-result" id="btTestResult"></span>
+            </div>
+          </div>
+          <div class="form-note" id="btWarn" style="display:none; margin-left:140px; color:var(--amber)">
+            ⚠️ 尚未填写设备名称或 MAC，无法判定在线状态。
+          </div>
+          <div class="form-note" style="margin-left:140px">
+            最易检出的两种情况：① 设备与本机已配对且保持蓝牙连接；② 设备处于「可被发现」状态
+            （如手机停在蓝牙设置页）。多数手机平时息屏不可被经典蓝牙发现，属系统限制。
           </div>
         </div>
         <details class="adv">
@@ -513,6 +549,16 @@
                 <option value="1000">1 秒</option><option value="2000">2 秒</option>
                 <option value="3000">3 秒</option><option value="5000">5 秒</option>
               </select>
+            </div>
+          </div>
+          <div class="form-row" style="margin-bottom:0">
+            <label>蓝牙扫描时长</label>
+            <div class="control">
+              <select id="selBtTimeout">
+                <option value="2">约 2.6 秒</option><option value="4">约 5.1 秒</option>
+                <option value="8">约 10.2 秒</option><option value="12">约 15.4 秒</option>
+              </select>
+              <span class="form-note" style="margin:0">时长越长，发现低可见性设备的概率越大</span>
             </div>
           </div>
         </details>
@@ -602,7 +648,7 @@ const { listen } = window.__TAURI__.event;
 
 let cfg = null;
 
-const TRIGGER_LABEL = { online: "IP 上线", offline: "IP 离线" };
+const TRIGGER_LABEL = { online: "上线", offline: "离线" };
 const ACTION_TYPES = [
   { v: "start_program", label: "▶ 启动监控程序" },
   { v: "stop_program", label: "⏹ 彻底关闭监控程序" },
@@ -731,22 +777,37 @@ function renderSettings() {
   if (!cfg) return;
   $("setPath").value = cfg.program_path || "";
   $("setIp").value = cfg.monitor_ip || "";
+  $("setBtDevice").value = cfg.bt_device || "";
   $("selPoll").value = String(cfg.poll_interval_sec);
   $("selTimeout").value = String(cfg.ping_timeout_ms);
+  $("selBtTimeout").value = String(cfg.bt_scan_timeout_mult || 4);
   $("chkHidden").checked = !!cfg.launch_hidden;
   $("chkTray").checked = cfg.close_to_tray !== false;
+  applyModeUI();
   renderRules();
+}
+
+function applyModeUI() {
+  const bt = cfg && cfg.monitor_mode === "bluetooth";
+  $("modeIp").classList.toggle("active", !bt);
+  $("modeBt").classList.toggle("active", !!bt);
+  $("ipFields").style.display = bt ? "none" : "";
+  $("btFields").style.display = bt ? "" : "none";
 }
 
 function renderStatusHints() {
   if (!cfg) return;
-  $("ipAddrText").textContent = cfg.monitor_ip || "（未配置 IP）";
-  $("ipPollHint").textContent = "每 " + cfg.poll_interval_sec + " 秒自动检测";
+  const bt = cfg.monitor_mode === "bluetooth";
+  $("ipAddrText").textContent = bt ? (cfg.bt_device || "（未配置蓝牙设备）") : (cfg.monitor_ip || "（未配置 IP）");
+  $("ipPollHint").textContent = bt
+    ? `蓝牙扫描约 ${Math.round((cfg.bt_scan_timeout_mult || 4) * 1.28)} 秒 + 间隔 ${cfg.poll_interval_sec} 秒`
+    : `每 ${cfg.poll_interval_sec} 秒自动检测`;
   const needPath = cfg.rules.some(r => r.enabled && r.action.type !== "run_command");
   $("setupBanner").classList.toggle("show", needPath && !cfg.program_path);
   $("progPathView").textContent = cfg.program_path ? cfg.program_path : "";
   const enable = !!cfg.program_path;
   ["btnStart", "btnStop", "btnShowWin", "btnHideWin"].forEach(id => $(id).disabled = !enable);
+  if ($("btWarn")) $("btWarn").style.display = bt && !cfg.bt_device ? "" : "none";
   renderRuleBriefs();
 }
 
@@ -854,7 +915,7 @@ function buildRuleCard(rule) {
   fTrig.className = "field";
   fTrig.innerHTML = "当";
   const selTrig = document.createElement("select");
-  selTrig.innerHTML = `<option value="online">IP 上线</option><option value="offline">IP 离线</option>`;
+  selTrig.innerHTML = `<option value="online">目标上线</option><option value="offline">目标离线</option>`;
   selTrig.value = rule.trigger;
   selTrig.addEventListener("change", () => { rule.trigger = selTrig.value; commitRule(rule); });
   fTrig.append(selTrig);
@@ -1128,6 +1189,105 @@ $("btnImportCfg").addEventListener("click", async () => {
   }
 });
 
+/* ===================== 监控方式与蓝牙 ===================== */
+$("modeIp").addEventListener("click", () => {
+  if (cfg.monitor_mode !== "ip") {
+    cfg.monitor_mode = "ip";
+    scheduleSave();
+    applyModeUI();
+    renderStatusHints();
+  }
+});
+$("modeBt").addEventListener("click", () => {
+  if (cfg.monitor_mode !== "bluetooth") {
+    cfg.monitor_mode = "bluetooth";
+    scheduleSave();
+    applyModeUI();
+    renderStatusHints();
+  }
+});
+
+$("setBtDevice").addEventListener("change", () => {
+  cfg.bt_device = $("setBtDevice").value.trim();
+  scheduleSave();
+  renderStatusHints();
+});
+
+$("btnBtTest").addEventListener("click", async () => {
+  const el = $("btTestResult");
+  const dev = $("setBtDevice").value.trim();
+  if (!dev) { el.className = "inline-result offline"; el.textContent = "请先填写设备名称或 MAC"; return; }
+  el.className = "inline-result"; el.textContent = "蓝牙扫描中…（约 5-10 秒）";
+  try {
+    const r = await invoke("test_bluetooth", { device: dev, timeoutMult: cfg.bt_scan_timeout_mult || 4 });
+    if (r.online) {
+      el.className = "inline-result online";
+      el.textContent = `● 在线：找到「${r.matched}」（扫描到 ${r.deviceCount} 个设备，${r.durationMs} ms）`;
+    } else {
+      el.className = "inline-result offline";
+      el.textContent = `○ 未找到目标（扫描到 ${r.deviceCount} 个设备，${r.durationMs} ms）`;
+    }
+  } catch (e) {
+    el.className = "inline-result offline"; el.textContent = e;
+  }
+});
+
+/* 扫描拾取器 */
+$("btnBtScan").addEventListener("click", async () => {
+  const btn = $("btnBtScan");
+  btn.disabled = true; btn.textContent = "扫描中…";
+  try {
+    const r = await invoke("bt_scan_devices", { timeoutMult: cfg.bt_scan_timeout_mult || 4 });
+    showScanPicker(r.devices, r.durationMs);
+  } catch (e) { toast("蓝牙扫描失败：" + e, "error", 6000); }
+  btn.disabled = false; btn.textContent = "🔍 扫描拾取";
+});
+
+function showScanPicker(devices, durationMs) {
+  const mask = document.createElement("div");
+  mask.className = "modal-mask show";
+  const modal = document.createElement("div");
+  modal.className = "modal";
+  modal.style.width = "min(480px, calc(100vw - 48px))";
+  const h = document.createElement("h4");
+  h.textContent = `发现 ${devices.length} 个蓝牙设备（${durationMs} ms）`;
+  const p = document.createElement("p");
+  p.textContent = "点击要监控的设备；名称为空的可按 MAC 选中。";
+  const list = document.createElement("div");
+  list.style.cssText = "max-height:320px; overflow-y:auto; margin-bottom:16px; display:flex; flex-direction:column; gap:6px;";
+  if (!devices.length) {
+    list.innerHTML = '<div class="empty-tip" style="padding:20px 0">未发现任何设备。请确认目标设备蓝牙已开启且处于「可被发现」状态。</div>';
+  }
+  for (const d of devices) {
+    const row = document.createElement("button");
+    row.className = "btn";
+    row.style.cssText = "justify-content:flex-start; text-align:left;";
+    const label = d.name ? d.name : "(名称未知)";
+    row.innerHTML = `${d.connected ? "🟢" : "🔵"} <b></b> <span class="form-note" style="margin:0"></span>`;
+    row.querySelector("b").textContent = label;
+    row.querySelector("span").textContent = d.address.replace(/(..)(?=.)/g, "$1:") + (d.connected ? " · 已连接" : "");
+    row.addEventListener("click", () => {
+      cfg.bt_device = d.name || d.address;
+      $("setBtDevice").value = cfg.bt_device;
+      scheduleSave();
+      renderStatusHints();
+      mask.remove();
+      toast("已选择：" + cfg.bt_device, "success");
+    });
+    list.appendChild(row);
+  }
+  const btns = document.createElement("div");
+  btns.className = "m-btns";
+  const close = document.createElement("button");
+  close.className = "btn"; close.textContent = "关闭";
+  close.addEventListener("click", () => mask.remove());
+  btns.appendChild(close);
+  modal.append(h, p, list, btns);
+  mask.appendChild(modal);
+  document.body.appendChild(mask);
+  mask.addEventListener("click", (e) => { if (e.target === mask) mask.remove(); });
+}
+
 /* ===================== 控制台交互 ===================== */
 $("linkageSwitch").addEventListener("change", () => {
   cfg.linkage_enabled = $("linkageSwitch").checked;
@@ -1140,11 +1300,11 @@ $("btnTestNow").addEventListener("click", async () => {
   el.textContent = "检测中…"; el.className = "state-word";
   const t0 = performance.now();
   try {
-    const r = await invoke("test_ip", { ip: cfg.monitor_ip || "127.0.0.1", timeoutMs: cfg.ping_timeout_ms });
-    const ms = Math.round(performance.now() - t0);
-    applyIpView(r.online, ms, "刚刚");
+    const r = await invoke("test_monitor");
+    applyIpView(r.online, Math.round(performance.now() - t0), "刚刚");
+    if (r.mode === "bluetooth") toast(r.online ? "蓝牙检测：目标在线" : "蓝牙检测：未发现目标", r.online ? "success" : "");
   } catch (e) { toast(e, "error"); }
-  setTimeout(refreshStatus, 500);
+  setTimeout(refreshStatus, 800);
 });
 
 $("btnStart").addEventListener("click", async () => {
@@ -1181,9 +1341,10 @@ function applyIpView(online, latencyMs, lastCheck) {
   word.textContent = online ? "在 线" : "离 线";
   if (latencyMs != null) $("ipLatency").textContent = latencyMs + " ms";
   if (lastCheck) $("ipLastCheck").textContent = lastCheck;
+  const bt = cfg && cfg.monitor_mode === "bluetooth";
   const pillIp = $("pillIp");
   pillIp.className = "pill " + (online ? "ok" : "bad");
-  $("pillIpText").textContent = online ? "IP 在线" : "IP 离线";
+  $("pillIpText").textContent = (bt ? "蓝牙" : "IP ") + (online ? "在线" : "离线");
 }
 
 async function refreshStatus() {
@@ -1193,7 +1354,8 @@ async function refreshStatus() {
       $("ipRing").className = "ring";
       const w = $("ipStateWord"); w.className = "state-word"; w.textContent = "未监测";
       $("ipLatency").textContent = "-";
-      $("pillIp").className = "pill"; $("pillIpText").textContent = "IP 未配置";
+      $("pillIp").className = "pill";
+      $("pillIpText").textContent = s.monitorMode === "bluetooth" ? "蓝牙未配置" : "IP 未配置";
     } else {
       applyIpView(s.ipOnline, s.latencyMs, s.ipLastCheck);
     }
@@ -1330,7 +1492,8 @@ $("btnClear").addEventListener("click", async () => {
   } catch (e) {
     toast("加载配置失败：" + e, "error");
     cfg = {
-      program_path: "", monitor_ip: "172.30.109.238", linkage_enabled: false,
+      program_path: "", monitor_ip: "172.30.109.238", monitor_mode: "ip",
+      bt_device: "", bt_scan_timeout_mult: 4, linkage_enabled: false,
       launch_hidden: true, close_to_tray: true, poll_interval_sec: 3, ping_timeout_ms: 2000,
       rules: [], rules_seeded: true,
     };

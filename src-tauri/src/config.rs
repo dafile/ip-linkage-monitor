@@ -84,6 +84,12 @@ pub struct Config {    /// 监控程序（掌上看家采集端）exe 路径，�
     pub program_path: String,
     /// 被监控的 IP 地址
     pub monitor_ip: String,
+    /// 监控方式：ip（Ping）| bluetooth（蓝牙邻近）
+    pub monitor_mode: String,
+    /// 蓝牙模式：要监控的设备名称或 MAC
+    pub bt_device: String,
+    /// 蓝牙查询时长倍数（×1.28 秒/单位）
+    pub bt_scan_timeout_mult: u32,
     /// 联动总开关（关闭时不调度任何规则）
     pub linkage_enabled: bool,
     /// 启动监控程序时隐藏其窗口（后台运行）
@@ -105,6 +111,9 @@ impl Default for Config {
         Self {
             program_path: String::new(),
             monitor_ip: "172.30.109.238".to_string(),
+            monitor_mode: "ip".to_string(),
+            bt_device: String::new(),
+            bt_scan_timeout_mult: 4,
             linkage_enabled: false,
             launch_hidden: true,
             close_to_tray: true,

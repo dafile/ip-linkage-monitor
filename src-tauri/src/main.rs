@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod bluetooth;
 mod commands;
 mod config;
 mod logger;
@@ -119,6 +120,9 @@ fn main() {
             commands::show_program_window,
             commands::hide_program_window,
             commands::test_ip,
+            commands::test_monitor,
+            commands::test_bluetooth,
+            commands::bt_scan_devices,
             commands::run_action,
             commands::add_rule,
             commands::update_rule,

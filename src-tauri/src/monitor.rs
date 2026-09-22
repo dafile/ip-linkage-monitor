@@ -3,8 +3,7 @@ use crate::config::{
     TRIGGER_ONLINE,
 };
 use crate::logger::{self, CAT_MONITOR, ERROR, INFO, WARN};
-use crate::netcheck;
-use crate::process;
+use crate::{bluetooth, netcheck, process};
 use crate::state::AppState;
 use chrono::Local;
 use serde::Serialize;
@@ -32,6 +31,7 @@ pub struct Status {
     pub program_running: bool,
     pub program_path_exists: bool,
     pub linkage_enabled: bool,
+    pub monitor_mode: String,
     pub pendings: Vec<PendingDto>,
     pub monitor_alive: bool,
 }
@@ -94,11 +94,18 @@ pub fn spawn_thread(_app: AppHandle, state: Arc<AppState>) {
         });
     }
     std::thread::spawn(move || {
-        logger::log(INFO, CAT_MONITOR, "IP 状态监控线程已启动");
+        logger::log(INFO, CAT_MONITOR, "状态监控线程已启动");
+        let mut scan_errors: u32 = 0;
         loop {
             let cfg = state.config_snapshot();
+            let bt_mode = cfg.monitor_mode == "bluetooth";
+            let target_ok = if bt_mode {
+                !cfg.bt_device.trim().is_empty()
+            } else {
+                !cfg.monitor_ip.trim().is_empty()
+            };
 
-            if cfg.monitor_ip.trim().is_empty() {
+            if !target_ok {
                 let mut m = state.monitor.lock().unwrap();
                 m.last_tick = Instant::now();
                 m.ip_online = None;
@@ -107,39 +114,79 @@ pub fn spawn_thread(_app: AppHandle, state: Arc<AppState>) {
                 drop(m);
             } else {
                 let t0 = Instant::now();
-                let online = netcheck::ping_once(&cfg.monitor_ip, cfg.ping_timeout_ms);
+                let scan: Result<bool, String> = if bt_mode {
+                    let dev = cfg.bt_device.trim().to_string();
+                    bluetooth::presence(&dev, cfg.bt_scan_timeout_mult)
+                } else {
+                    let ip = cfg.monitor_ip.trim().to_string();
+                    Ok(netcheck::ping_once(&ip, cfg.ping_timeout_ms))
+                };
                 let latency = t0.elapsed().as_millis() as u64;
 
-                let mut transition: Option<bool> = None;
-                let mut first_result = false;
-                {
-                    let mut m = state.monitor.lock().unwrap();
-                    m.last_tick = Instant::now();
-                    m.ip_last_check = Some(now_ts());
-                    m.latency_ms = Some(latency);
-                    match m.ip_online {
-                        Some(prev) if prev != online => transition = Some(online),
-                        None => first_result = true,
-                        _ => {}
+                match scan {
+                    Err(e) => {
+                        // 扫描异常（如无蓝牙适配器）：保持原状态不触发联动，限流记录日志
+                        scan_errors += 1;
+                        if scan_errors == 1 || scan_errors % 10 == 0 {
+                            let kind = if bt_mode { "蓝牙扫描" } else { "IP 检测" };
+                            logger::log(
+                                WARN,
+                                CAT_MONITOR,
+                                &format!("{kind}失败（连续 {scan_errors} 次）：{e}"),
+                            );
+                        }
+                        let mut m = state.monitor.lock().unwrap();
+                        m.last_tick = Instant::now();
+                        m.ip_last_check = Some(now_ts());
+                        drop(m);
                     }
-                    m.ip_online = Some(online);
-                }
-                if first_result {
-                    let word = if online { "在线" } else { "离线" };
-                    logger::log(
-                        INFO,
-                        CAT_MONITOR,
-                        &format!("初始检测完成：{} 当前{word}（{latency} ms）", cfg.monitor_ip),
-                    );
-                }
-                if let Some(online) = transition {
-                    on_transition(&state, &cfg, online);
+                    Ok(online) => {
+                        if scan_errors > 0 {
+                            logger::log(INFO, CAT_MONITOR, "检测已恢复正常");
+                            scan_errors = 0;
+                        }
+                        let subject = if bt_mode {
+                            format!("蓝牙设备「{}」", cfg.bt_device.trim())
+                        } else {
+                            format!("IP {}", cfg.monitor_ip.trim())
+                        };
+                        handle_presence(&state, &cfg, online, latency, &subject);
+                    }
                 }
             }
 
             std::thread::sleep(Duration::from_secs(cfg.poll_interval_sec.clamp(1, 60) as u64));
         }
     });
+}
+
+/// 处理一次成功的检测结果：更新状态、记录首检、触发联动
+fn handle_presence(state: &Arc<AppState>, cfg: &Config, online: bool, latency_ms: u64, subject: &str) {
+    let mut transition: Option<bool> = None;
+    let mut first_result = false;
+    {
+        let mut m = state.monitor.lock().unwrap();
+        m.last_tick = Instant::now();
+        m.ip_last_check = Some(now_ts());
+        m.latency_ms = Some(latency_ms);
+        match m.ip_online {
+            Some(prev) if prev != online => transition = Some(online),
+            None => first_result = true,
+            _ => {}
+        }
+        m.ip_online = Some(online);
+    }
+    let word = if online { "在线" } else { "离线" };
+    if first_result {
+        logger::log(
+            INFO,
+            CAT_MONITOR,
+            &format!("初始检测完成：{subject} 当前{word}（{latency_ms} ms）"),
+        );
+    }
+    if let Some(online) = transition {
+        on_transition(state, cfg, online, subject);
+    }
 }
 
 fn fmt_delay_text(sec: u32) -> String {
@@ -155,14 +202,10 @@ fn fmt_delay_text(sec: u32) -> String {
 }
 
 /// IP 状态变化处理：作废失效任务，按规则调度新任务
-fn on_transition(state: &Arc<AppState>, cfg: &Config, online: bool) {
+fn on_transition(state: &Arc<AppState>, cfg: &Config, online: bool, subject: &str) {
     let new_trigger = if online { TRIGGER_ONLINE } else { TRIGGER_OFFLINE };
     let word = if online { "上线" } else { "离线" };
-    logger::log(
-        INFO,
-        CAT_MONITOR,
-        &format!("IP 状态变化：{} 已{word}", cfg.monitor_ip),
-    );
+    logger::log(INFO, CAT_MONITOR, &format!("目标状态变化：{subject} 已{word}"));
 
     // 状态反转后，触发条件与新状态不符的待执行任务一律作废
     {
@@ -178,7 +221,7 @@ fn on_transition(state: &Arc<AppState>, cfg: &Config, online: bool) {
                 INFO,
                 CAT_MONITOR,
                 &format!(
-                    "IP 已{word}，作废待执行任务「{}」（{}）",
+                    "目标已{word}，作废待执行任务「{}」（{}）",
                     p.note,
                     p.action.desc()
                 ),
@@ -190,11 +233,11 @@ fn on_transition(state: &Arc<AppState>, cfg: &Config, online: bool) {
         return;
     }
     for rule in cfg.rules.iter().filter(|r| r.enabled && r.trigger == new_trigger) {
-        schedule_rule(state, rule, word);
+        schedule_rule(state, rule, subject, word);
     }
 }
 
-fn schedule_rule(state: &AppState, rule: &LinkageRule, state_word: &str) {
+fn schedule_rule(state: &AppState, rule: &LinkageRule, subject: &str, state_word: &str) {
     let mut m = state.monitor.lock().unwrap();
     if m.pending.iter().any(|p| p.rule_id == rule.id) {
         return; // 该规则已有任务在排队
@@ -221,10 +264,8 @@ fn schedule_rule(state: &AppState, rule: &LinkageRule, state_word: &str) {
         INFO,
         CAT_MONITOR,
         &format!(
-            "联动规则「{}」：IP 已{}，{}{}（预定 {due_ts}）",
+            "联动规则「{}」：{subject} 已{state_word}，{when}{}（预定 {due_ts}）",
             rule.note,
-            state_word,
-            when,
             rule.action.desc()
         ),
     );
@@ -411,6 +452,7 @@ pub fn build_status(state: &AppState) -> Status {
         program_running,
         program_path_exists: path_exists,
         linkage_enabled: cfg.linkage_enabled,
+        monitor_mode: cfg.monitor_mode.clone(),
         pendings,
         monitor_alive: m.last_tick.elapsed() < HEARTBEAT_TIMEOUT,
     }
@@ -599,7 +641,7 @@ mod tests {
         let state = make_state(cfg);
 
         // 上线 → 调度规则1（关闭监控程序）
-        on_transition(&state, &state.config_snapshot(), true);
+        on_transition(&state, &state.config_snapshot(), true, "IP 192.0.2.1");
         {
             let m = state.monitor.lock().unwrap();
             assert_eq!(m.pending.len(), 1, "上线应调度 1 条规则");
@@ -608,7 +650,7 @@ mod tests {
         }
 
         // 离线 → 规则1作废，调度规则2（启动监控程序）
-        on_transition(&state, &state.config_snapshot(), false);
+        on_transition(&state, &state.config_snapshot(), false, "IP 192.0.2.1");
         {
             let m = state.monitor.lock().unwrap();
             assert_eq!(m.pending.len(), 1, "反转后应只剩离线规则");
@@ -621,7 +663,7 @@ mod tests {
         assert!(state.monitor.lock().unwrap().pending.is_empty());
 
         // 按规则 ID 取消
-        on_transition(&state, &state.config_snapshot(), true);
+        on_transition(&state, &state.config_snapshot(), true, "IP 192.0.2.1");
         let cancelled = cancel_pending(&state, Some(1));
         assert_eq!(cancelled.len(), 1);
         assert!(state.monitor.lock().unwrap().pending.is_empty());
@@ -632,7 +674,7 @@ mod tests {
             rules: Config::default_rules(),
             ..Config::default()
         };
-        on_transition(&state, &cfg_off, true);
+        on_transition(&state, &cfg_off, true, "IP 192.0.2.1");
         assert!(state.monitor.lock().unwrap().pending.is_empty());
     }
 
@@ -654,7 +696,7 @@ mod tests {
             ..Config::default()
         };
         let state = make_state(cfg);
-        on_transition(&state, &state.config_snapshot(), true);
+        on_transition(&state, &state.config_snapshot(), true, "IP 192.0.2.1");
         let m = state.monitor.lock().unwrap();
         assert_eq!(m.pending.len(), 2, "上线应同时调度规则 1 和 3");
     }
