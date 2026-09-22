@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 use tauri::AppHandle;
 
 /// 监控线程心跳超时：超过该时长未跳动视为线程异常
-const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
+/// （蓝牙定向探测在设备不可达时可能阻塞 15~20 秒，阈值需覆盖）
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
 /// 防复活验证时长与复活强杀轮次上限
 const STAY_DEAD_SECS: u64 = 15;
 const MAX_RESPAWN_KILLS: u32 = 6;

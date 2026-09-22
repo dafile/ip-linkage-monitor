@@ -36,6 +36,8 @@ use windows::core::HSTRING;
 use windows::Devices::Bluetooth::GenericAttributeProfile::GattClientCharacteristicConfigurationDescriptorValue;
 use windows::Devices::Bluetooth::GenericAttributeProfile::GattCommunicationStatus;
 use windows::Devices::Bluetooth::GenericAttributeProfile::GattSession;
+use windows::Devices::Bluetooth::Rfcomm::RfcommDeviceServicesResult;
+use windows::Devices::Bluetooth::{BluetoothCacheMode, BluetoothDevice, BluetoothError};
 use windows::Devices::Bluetooth::{BluetoothConnectionStatus, BluetoothLEDevice};
 use windows::Devices::Enumeration::DeviceInformation;
 
@@ -407,9 +409,75 @@ pub fn scan_all(timeout_mult: u32) -> Result<Vec<BtDevice>, String> {
     Ok(out)
 }
 
-/// 判断目标设备是否真实在附近。
-/// 已配对：系统 BLE 连接 ∨ 经典档案连接；未配对：inquiry 真实听到。
-pub fn presence(matcher: &str, timeout_mult: u32) -> Result<bool, String> {
+/* ===================== 通道②：定向探测（寻呼，对所有开着蓝牙的手机有效） ===================== */
+
+static PROBE: OnceLock<Mutex<Option<(std::time::Instant, bool)>>> = OnceLock::new();
+/// 探测结果缓存时长（避免频繁寻呼手机，也保证离线判定在 ~10 秒内生效）
+const PROBE_TTL: Duration = Duration::from_secs(10);
+/// 单次探测的看门狗（设备不可达时系统调用可能长时间阻塞）
+const PROBE_WATCHDOG: Duration = Duration::from_secs(15);
+
+/// 定向服务发现（RFCOMM/SDP）＝对已知 MAC 寻呼：手机开着蓝牙且在范围内
+/// 一定会响应配对设备的寻呼（与"可被发现"无关）。
+/// 可达 → Some(true)；不可达 → Some(false)；API 异常 → None。
+pub fn rfcomm_probe(addr_hex: &str) -> Option<bool> {
+    {
+        let lock = PROBE.get_or_init(|| Mutex::new(None)).lock().unwrap();
+        if let Some((t, v)) = lock.as_ref() {
+            if t.elapsed() < PROBE_TTL {
+                return Some(*v);
+            }
+        }
+    }
+    let r = probe_once(addr_hex)?;
+    let mut lock = PROBE.get_or_init(|| Mutex::new(None)).lock().unwrap();
+    *lock = Some((std::time::Instant::now(), r));
+    Some(r)
+}
+
+fn probe_once(addr_hex: &str) -> Option<bool> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let addr_str = addr_hex.trim().to_string();
+    std::thread::spawn(move || {
+        let r = (|| -> Option<bool> {
+            let addr = u64::from_str_radix(&addr_str, 16).ok()?;
+            let dev = BluetoothDevice::FromBluetoothAddressAsync(addr).ok()?.get().ok()?;
+            let result: RfcommDeviceServicesResult = dev
+                .GetRfcommServicesWithCacheModeAsync(BluetoothCacheMode::Uncached)
+                .ok()?
+                .get()
+                .ok()?;
+            let err = result.Error().ok()?;
+            let services = result.Services().ok()?.Size().ok()?;
+            Some(err == BluetoothError::Success && services > 0)
+        })();
+        let _ = tx.send(r);
+    });
+    rx.recv_timeout(PROBE_WATCHDOG).ok().flatten()
+}
+
+/* ===================== 在场判定（多通道汇总） ===================== */
+
+/// 一次在场检测的详细结果
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PresenceDetail {
+    pub online: bool,
+    /// 系统维持连接是否已连上（BLE）
+    pub ble_connected: bool,
+    /// 是否有经典蓝牙档案在连接
+    pub classic_connected: bool,
+    /// 定向探测结果（None = 未执行/无信息）
+    pub probe: Option<bool>,
+    /// 主动扫描结果（未配对兜底时才有）
+    pub scanned: Option<bool>,
+    /// paired = 已配对（通道①②③）；scan = 未配对（通道④）
+    pub mode: String,
+}
+
+/// 判断目标设备是否真实在附近（多通道汇总，带详细结果）。
+/// 已配对：系统 BLE 连接 ∨ 经典档案连接 ∨ 定向探测可达；未配对：inquiry 真实听到。
+pub fn presence_detail(matcher: &str, timeout_mult: u32) -> Result<PresenceDetail, String> {
     let key = matcher.trim().to_string();
     if key.is_empty() {
         return Err("未指定要监控的蓝牙设备（名称或 MAC）".into());
@@ -435,18 +503,48 @@ pub fn presence(matcher: &str, timeout_mult: u32) -> Result<bool, String> {
         }
     }
     if let Some((_, link)) = guard.as_ref() {
-        if link_connected(link)? {
-            return Ok(true);
-        }
-        // BLE 未连：经典档案在连接同样算在场
-        drop(guard);
-        return Ok(classic_connected(matcher));
+        let ble_connected = link_connected(link)?;
+        let classic = classic_connected(matcher);
+        let mut probe = None;
+        let online = if ble_connected || classic {
+            true
+        } else {
+            // 手机的 BLE 空闲时不广播，系统主动连不上；改用定向寻呼探测
+            let addr = if link.address.is_empty() {
+                normalize_mac(matcher).unwrap_or_default()
+            } else {
+                link.address.clone()
+            };
+            probe = if addr.is_empty() { None } else { rfcomm_probe(&addr) };
+            probe.unwrap_or(false)
+        };
+        return Ok(PresenceDetail {
+            online,
+            ble_connected,
+            classic_connected: classic,
+            probe,
+            scanned: None,
+            mode: "paired".into(),
+        });
     }
     drop(guard);
     // 未配对 → 兜底：经典 inquiry（仅「可被发现」设备可见）
-    Ok(inquiry(timeout_mult)?
+    let scanned = inquiry(timeout_mult)?
         .iter()
-        .any(|d| d.in_range && device_matches(&d.name, &d.address, matcher)))
+        .any(|d| d.in_range && device_matches(&d.name, &d.address, matcher));
+    Ok(PresenceDetail {
+        online: scanned,
+        ble_connected: false,
+        classic_connected: false,
+        probe: None,
+        scanned: Some(scanned),
+        mode: "scan".into(),
+    })
+}
+
+/// 判断目标设备是否真实在附近（在线即 true）
+pub fn presence(matcher: &str, timeout_mult: u32) -> Result<bool, String> {
+    Ok(presence_detail(matcher, timeout_mult)?.online)
 }
 
 /// 当前系统维持连接绑定的目标（名称, MAC）；未绑定时返回 None

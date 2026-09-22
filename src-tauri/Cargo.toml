@@ -30,6 +30,7 @@ winapi = { version = "0.3", features = [
 ] }
 windows = { version = "0.58", features = [
     "Devices_Bluetooth",
+    "Devices_Bluetooth_Rfcomm",
     "Devices_Bluetooth_GenericAttributeProfile",
     "Devices_Enumeration",
     "Foundation",

@@ -560,11 +560,13 @@ pub async fn test_monitor(state: State<'_, Arc<AppState>>) -> Result<MonitorTest
 pub struct BtTestResult {
     pub online: bool,
     pub duration_ms: u64,
-    /// paired = 系统连接直读（已配对设备）；scan = 主动扫描（未配对兜底）
+    /// paired = 已配对多通道；scan = 主动扫描（未配对兜底）
     pub mode: String,
+    /// 判定过程明细（供界面直接展示）
+    pub detail: String,
 }
 
-/// 设置页「测试蓝牙检测」：按两级策略检测目标是否在场
+/// 设置页「测试蓝牙检测」：按多通道策略检测目标是否在场
 #[tauri::command]
 pub async fn test_bluetooth(device: String, timeout_mult: u32) -> Result<BtTestResult, String> {
     let dev = device.trim().to_string();
@@ -578,27 +580,45 @@ pub async fn test_bluetooth(device: String, timeout_mult: u32) -> Result<BtTestR
         CAT_USER,
         &format!(
             "测试蓝牙检测：「{dev}」（{}）…",
-            if paired { "已配对，系统连接直读" } else { "未配对，主动扫描" }
+            if paired { "已配对，多通道检测" } else { "未配对，主动扫描" }
         ),
     );
     let t0 = Instant::now();
-    let online = tauri::async_runtime::spawn_blocking(move || bluetooth::presence(&dev, mult))
+    let d = tauri::async_runtime::spawn_blocking(move || bluetooth::presence_detail(&dev, mult))
         .await
         .map_err(|e| e.to_string())??;
     let duration = t0.elapsed().as_millis() as u64;
-    let mode = if paired { "paired" } else { "scan" };
     let bound = bluetooth::link_target().map(|(n, a)| format!("{n} ({})", bluetooth::mac_colon(&a)));
+    let detail = if d.mode == "paired" {
+        let mut parts = vec![format!("BLE维持连接：{}", if d.ble_connected { "已连接" } else { "未连接" })];
+        if d.classic_connected {
+            parts.push("经典档案连接：在连接".into());
+        }
+        if let Some(p) = d.probe {
+            parts.push(format!(
+                "定向探测：{}",
+                if p { "可达（手机在附近）" } else { "不可达（不在范围或蓝牙已关）" }
+            ));
+        }
+        if let Some(b) = bound {
+            parts.push(format!("绑定 {b}"));
+        }
+        parts.join("；")
+    } else {
+        format!(
+            "主动扫描：{}（未配对设备仅「可被发现」时可见）",
+            if d.scanned == Some(true) { "发现目标" } else { "未发现目标" }
+        )
+    };
     logger::log(
         INFO,
         CAT_USER,
         &format!(
-            "蓝牙检测结果：{}（{}，{duration} ms{}）",
-            if online { "在线" } else { "离线" },
-            if paired { "系统连接直读" } else { "主动扫描" },
-            bound.map(|b| format!("，绑定 {b}")).unwrap_or_default()
+            "蓝牙检测结果：{}（{duration} ms）{detail}",
+            if d.online { "在线" } else { "离线" }
         ),
     );
-    Ok(BtTestResult { online, duration_ms: duration, mode: mode.to_string() })
+    Ok(BtTestResult { online: d.online, duration_ms: duration, mode: d.mode, detail })
 }
 
 #[derive(serde::Serialize)]
