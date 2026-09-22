@@ -575,21 +575,23 @@ pub async fn test_bluetooth(device: String, timeout_mult: u32) -> Result<BtTestR
         .await
         .map_err(|e| e.to_string())??;
     let duration = t0.elapsed().as_millis() as u64;
+    let in_range_count = devs.iter().filter(|d| d.in_range).count();
     let matched = devs
         .iter()
-        .find(|d| bluetooth::device_matches(&d.name, &d.address, &dev));
+        .find(|d| d.in_range && bluetooth::device_matches(&d.name, &d.address, &dev));
     logger::log(
         INFO,
         CAT_USER,
         &format!(
-            "蓝牙检测结果：{}（扫描到 {} 个设备，{duration} ms）",
+            "蓝牙检测结果：{}（在场 {} 个 / 缓存 {} 个，{duration} ms）",
             if matched.is_some() { "找到目标" } else { "未找到目标" },
-            devs.len()
+            in_range_count,
+            devs.len() - in_range_count
         ),
     );
     Ok(BtTestResult {
         online: matched.is_some(),
-        device_count: devs.len(),
+        device_count: in_range_count,
         duration_ms: duration,
         matched: matched.map(|d| if d.name.is_empty() { d.address.clone() } else { d.name.clone() }),
     })

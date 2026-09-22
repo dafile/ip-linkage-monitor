@@ -333,7 +333,7 @@
     <div class="logo"></div>
     <div>
       <h1>掌上看家联动 IP 在线状态监控</h1>
-      <div class="sub">IP Linkage Monitor v1.3.0</div>
+      <div class="sub">IP Linkage Monitor v1.3.1</div>
     </div>
     <div class="spacer"></div>
     <div class="top-pills">
@@ -1222,10 +1222,10 @@ $("btnBtTest").addEventListener("click", async () => {
     const r = await invoke("test_bluetooth", { device: dev, timeoutMult: cfg.bt_scan_timeout_mult || 4 });
     if (r.online) {
       el.className = "inline-result online";
-      el.textContent = `● 在线：找到「${r.matched}」（扫描到 ${r.deviceCount} 个设备，${r.durationMs} ms）`;
+      el.textContent = `● 在线：找到「${r.matched}」（在场 ${r.deviceCount} 个设备，${r.durationMs} ms）`;
     } else {
       el.className = "inline-result offline";
-      el.textContent = `○ 未找到目标（扫描到 ${r.deviceCount} 个设备，${r.durationMs} ms）`;
+      el.textContent = `○ 未找到目标（在场 ${r.deviceCount} 个设备，${r.durationMs} ms）`;
     }
   } catch (e) {
     el.className = "inline-result offline"; el.textContent = e;
@@ -1244,19 +1244,21 @@ $("btnBtScan").addEventListener("click", async () => {
 });
 
 function showScanPicker(devices, durationMs) {
+  // 只显示真实在场设备（inquiry 听到或已连接）；配对缓存设备不可靠，不提供选择
+  devices = (devices || []).filter(d => d.inRange);
   const mask = document.createElement("div");
   mask.className = "modal-mask show";
   const modal = document.createElement("div");
   modal.className = "modal";
   modal.style.width = "min(480px, calc(100vw - 48px))";
   const h = document.createElement("h4");
-  h.textContent = `发现 ${devices.length} 个蓝牙设备（${durationMs} ms）`;
+  h.textContent = `附近发现 ${devices.length} 个蓝牙设备（${durationMs} ms）`;
   const p = document.createElement("p");
-  p.textContent = "点击要监控的设备；名称为空的可按 MAC 选中。";
+  p.textContent = "点击要监控的设备。仅显示当前真实在场的设备；名称为空的可按 MAC 选中。";
   const list = document.createElement("div");
   list.style.cssText = "max-height:320px; overflow-y:auto; margin-bottom:16px; display:flex; flex-direction:column; gap:6px;";
   if (!devices.length) {
-    list.innerHTML = '<div class="empty-tip" style="padding:20px 0">未发现任何设备。请确认目标设备蓝牙已开启且处于「可被发现」状态。</div>';
+    list.innerHTML = '<div class="empty-tip" style="padding:20px 0">附近未发现任何蓝牙设备。请确认目标设备蓝牙已开启且处于「可被发现」状态（或与电脑保持蓝牙连接）。</div>';
   }
   for (const d of devices) {
     const row = document.createElement("button");
