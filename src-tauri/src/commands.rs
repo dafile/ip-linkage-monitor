@@ -556,12 +556,12 @@ pub async fn test_monitor(state: State<'_, Arc<AppState>>) -> Result<MonitorTest
 #[derive(serde::Serialize)]
 pub struct BtTestResult {
     pub online: bool,
-    pub device_count: usize,
     pub duration_ms: u64,
-    pub matched: Option<String>,
+    /// paired = 系统连接直读（已配对设备）；scan = 主动扫描（未配对兜底）
+    pub mode: String,
 }
 
-/// 设置页「测试蓝牙检测」：扫描并列出是否找到目标
+/// 设置页「测试蓝牙检测」：按两级策略检测目标是否在场
 #[tauri::command]
 pub async fn test_bluetooth(device: String, timeout_mult: u32) -> Result<BtTestResult, String> {
     let dev = device.trim().to_string();
@@ -569,32 +569,41 @@ pub async fn test_bluetooth(device: String, timeout_mult: u32) -> Result<BtTestR
         return Err("请先填写设备名称或 MAC".into());
     }
     let mult = timeout_mult.clamp(1, 48);
-    logger::log(INFO, CAT_USER, &format!("测试蓝牙检测：「{dev}」…"));
-    let t0 = Instant::now();
-    let devs = tauri::async_runtime::spawn_blocking(move || bluetooth::inquiry(mult))
-        .await
-        .map_err(|e| e.to_string())??;
-    let duration = t0.elapsed().as_millis() as u64;
-    let in_range_count = devs.iter().filter(|d| d.in_range).count();
-    let matched = devs
-        .iter()
-        .find(|d| d.in_range && bluetooth::device_matches(&d.name, &d.address, &dev));
+    let paired = bluetooth::paired_match_exists(&dev).unwrap_or(false);
     logger::log(
         INFO,
         CAT_USER,
         &format!(
-            "蓝牙检测结果：{}（在场 {} 个 / 缓存 {} 个，{duration} ms）",
-            if matched.is_some() { "找到目标" } else { "未找到目标" },
-            in_range_count,
-            devs.len() - in_range_count
+            "测试蓝牙检测：「{dev}」（{}）…",
+            if paired { "已配对，系统连接直读" } else { "未配对，主动扫描" }
         ),
     );
-    Ok(BtTestResult {
-        online: matched.is_some(),
-        device_count: in_range_count,
-        duration_ms: duration,
-        matched: matched.map(|d| if d.name.is_empty() { d.address.clone() } else { d.name.clone() }),
-    })
+    let t0 = Instant::now();
+    let online = tauri::async_runtime::spawn_blocking(move || bluetooth::presence(&dev, mult))
+        .await
+        .map_err(|e| e.to_string())??;
+    let duration = t0.elapsed().as_millis() as u64;
+    let mode = if paired { "paired" } else { "scan" };
+    let bound = bluetooth::link_target().map(|(n, a)| {
+        let mac = a
+            .as_bytes()
+            .chunks(2)
+            .map(|c| String::from_utf8_lossy(c).to_string())
+            .collect::<Vec<_>>()
+            .join(":");
+        format!("{n} ({mac})")
+    });
+    logger::log(
+        INFO,
+        CAT_USER,
+        &format!(
+            "蓝牙检测结果：{}（{}，{duration} ms{}）",
+            if online { "在线" } else { "离线" },
+            if paired { "系统连接直读" } else { "主动扫描" },
+            bound.map(|b| format!("，绑定 {b}")).unwrap_or_default()
+        ),
+    );
+    Ok(BtTestResult { online, duration_ms: duration, mode: mode.to_string() })
 }
 
 #[derive(serde::Serialize)]
@@ -603,15 +612,28 @@ pub struct BtScanList {
     pub duration_ms: u64,
 }
 
-/// 扫描附近蓝牙设备（供前端拾取器选择目标）
+/// 扫描附近蓝牙设备（供前端拾取器选择目标）：已配对设备 + inquiry 在场设备
 #[tauri::command]
 pub async fn bt_scan_devices(timeout_mult: u32) -> Result<BtScanList, String> {
     let mult = timeout_mult.clamp(1, 48);
     let t0 = Instant::now();
-    let devices = tauri::async_runtime::spawn_blocking(move || bluetooth::inquiry(mult))
+    let devices = tauri::async_runtime::spawn_blocking(move || bluetooth::scan_all(mult))
         .await
         .map_err(|e| e.to_string())??;
     Ok(BtScanList { devices, duration_ms: t0.elapsed().as_millis() as u64 })
+}
+
+/// 打开系统蓝牙设置（引导用户配对手机）
+#[tauri::command]
+pub fn bt_open_settings() -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    std::process::Command::new("explorer.exe")
+        .arg("ms-settings:bluetooth")
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("打开系统设置失败：{e}"))
 }
 
 /* ===================== 配置文件导入/导出 ===================== */

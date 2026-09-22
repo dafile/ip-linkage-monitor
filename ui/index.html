@@ -519,6 +519,7 @@
             <label></label>
             <div class="control">
               <button class="btn sm" id="btnBtTest">🔌 测试蓝牙检测</button>
+              <button class="btn sm" id="btnBtSettings">⚙ 打开系统蓝牙设置</button>
               <span class="inline-result" id="btTestResult"></span>
             </div>
           </div>
@@ -526,8 +527,10 @@
             ⚠️ 尚未填写设备名称或 MAC，无法判定在线状态。
           </div>
           <div class="form-note" style="margin-left:140px">
-            最易检出的两种情况：① 设备与本机已配对且保持蓝牙连接；② 设备处于「可被发现」状态
-            （如手机停在蓝牙设置页）。多数手机平时息屏不可被经典蓝牙发现，属系统限制。
+            <b>推荐流程</b>：手机与电脑在系统蓝牙中<b>配对一次</b>后，程序通过系统 API 维持一条低功耗蓝牙连接——
+            手机只要在蓝牙范围内即判定在线，离开范围自动判定离线。<br />
+            无需连接 WiFi、无需手机保持「可被发现」、手机端零操作（耗电极低）。
+            未配对时退回主动扫描（仅能看到「可被发现」的设备）。
           </div>
         </div>
         <details class="adv">
@@ -1217,19 +1220,23 @@ $("btnBtTest").addEventListener("click", async () => {
   const el = $("btTestResult");
   const dev = $("setBtDevice").value.trim();
   if (!dev) { el.className = "inline-result offline"; el.textContent = "请先填写设备名称或 MAC"; return; }
-  el.className = "inline-result"; el.textContent = "蓝牙扫描中…（约 5-10 秒）";
+  el.className = "inline-result"; el.textContent = "蓝牙检测中…（约 5-10 秒）";
   try {
     const r = await invoke("test_bluetooth", { device: dev, timeoutMult: cfg.bt_scan_timeout_mult || 4 });
-    if (r.online) {
-      el.className = "inline-result online";
-      el.textContent = `● 在线：找到「${r.matched}」（在场 ${r.deviceCount} 个设备，${r.durationMs} ms）`;
+    el.className = r.online ? "inline-result online" : "inline-result offline";
+    if (r.mode === "paired") {
+      el.textContent = `● 系统连接直读：${r.online ? "手机在蓝牙范围内（已连接）" : "不在范围内（未连接）"}（${r.durationMs} ms）`;
     } else {
-      el.className = "inline-result offline";
-      el.textContent = `○ 未找到目标（在场 ${r.deviceCount} 个设备，${r.durationMs} ms）`;
+      el.textContent = `○ 主动扫描：${r.online ? "发现目标" : "未发现目标"}（${r.durationMs} ms）`;
+      if (!r.online) el.textContent += "——建议先与电脑配对以获得稳定检测";
     }
   } catch (e) {
     el.className = "inline-result offline"; el.textContent = e;
   }
+});
+
+$("btnBtSettings").addEventListener("click", async () => {
+  try { await invoke("bt_open_settings"); toast("已打开系统蓝牙设置", "success"); } catch (e) { toast(e, "error"); }
 });
 
 /* 扫描拾取器 */
@@ -1244,30 +1251,33 @@ $("btnBtScan").addEventListener("click", async () => {
 });
 
 function showScanPicker(devices, durationMs) {
-  // 只显示真实在场设备（inquiry 听到或已连接）；配对缓存设备不可靠，不提供选择
-  devices = (devices || []).filter(d => d.inRange);
+  // 已配对设备优先展示（推荐监控目标），其后为 inquiry 真实在场设备
+  devices = (devices || []).filter(d => d.paired || d.inRange);
+  devices.sort((a, b) => (b.connected - a.connected) || ((b.paired ? 1 : 0) - (a.paired ? 1 : 0)));
   const mask = document.createElement("div");
   mask.className = "modal-mask show";
   const modal = document.createElement("div");
   modal.className = "modal";
   modal.style.width = "min(480px, calc(100vw - 48px))";
   const h = document.createElement("h4");
-  h.textContent = `附近发现 ${devices.length} 个蓝牙设备（${durationMs} ms）`;
+  h.textContent = `蓝牙设备（${durationMs} ms）`;
   const p = document.createElement("p");
-  p.textContent = "点击要监控的设备。仅显示当前真实在场的设备；名称为空的可按 MAC 选中。";
+  p.textContent = "点击要监控的设备。优先选择已配对设备（🟢/🔵），系统 API 直读更稳定。";
   const list = document.createElement("div");
   list.style.cssText = "max-height:320px; overflow-y:auto; margin-bottom:16px; display:flex; flex-direction:column; gap:6px;";
   if (!devices.length) {
-    list.innerHTML = '<div class="empty-tip" style="padding:20px 0">附近未发现任何蓝牙设备。请确认目标设备蓝牙已开启且处于「可被发现」状态（或与电脑保持蓝牙连接）。</div>';
+    list.innerHTML = '<div class="empty-tip" style="padding:20px 0">附近未发现蓝牙设备，且本机没有已配对设备。<br />建议：先点「⚙ 打开系统蓝牙设置」与手机配对，配对后即可稳定检测。</div>';
   }
   for (const d of devices) {
     const row = document.createElement("button");
     row.className = "btn";
     row.style.cssText = "justify-content:flex-start; text-align:left;";
     const label = d.name ? d.name : "(名称未知)";
-    row.innerHTML = `${d.connected ? "🟢" : "🔵"} <b></b> <span class="form-note" style="margin:0"></span>`;
+    const icon = d.connected ? "🟢" : (d.paired ? "🔵" : "⚪");
+    const state = d.connected ? "已连接" : (d.paired ? "已配对" : "在场未配对");
+    row.innerHTML = `${icon} <b></b> <span class="form-note" style="margin:0"></span>`;
     row.querySelector("b").textContent = label;
-    row.querySelector("span").textContent = d.address.replace(/(..)(?=.)/g, "$1:") + (d.connected ? " · 已连接" : "");
+    row.querySelector("span").textContent = d.address.replace(/(..)(?=.)/g, "$1:") + " · " + state;
     row.addEventListener("click", () => {
       cfg.bt_device = d.name || d.address;
       $("setBtDevice").value = cfg.bt_device;

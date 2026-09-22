@@ -1,14 +1,19 @@
-//! 蓝牙邻近检测：通过 Windows 经典蓝牙查询（inquiry）发现附近设备。
+//! 蓝牙邻近检测，两级策略：
 //!
-//! 在场判定（关键）：搜索结果中会混入本机「已配对 / 记住」的缓存设备，
-//! 与设备当前是否在附近无关（手机关机也会出现）。蓝牙栈只有在 inquiry
-//! 真实听到设备时才会刷新其 stLastSeen 时间戳，因此以
-//! 「stLastSeen ≥ 本次扫描开始时刻」或「当前已连接」判定真实在场。
+//! ① 系统连接直读（推荐，最可靠）：设备与本机已配对时，通过 WinRT
+//!    `GattSession.MaintainConnection` 让 Windows 持续维持一条 BLE 连接——
+//!    手机只要在蓝牙范围内系统就自动连上，离开范围自动断开。
+//!    直读 `ConnectionStatus` 即"在不在范围"：无需手机可发现、无需连 WiFi、
+//!    手机端零操作（配对一次即可）。会话对象常驻内存，跨检测轮次复用。
 //!
-//! 最可靠的监控对象：与本机保持蓝牙连接的设备；其次是处于「可被发现」
-//! 状态的设备（如手机停在蓝牙设置页）。多数手机平时息屏不可被经典蓝牙
-//! 查询发现，这是系统层面的限制。
+//! ② 经典查询扫描（兜底）：对未配对设备执行 inquiry。只有处于「可被发现」
+//!    状态的设备才能被听到；结果中的「已配对/记住」缓存条目与在场无关
+//!    （手机关机也会出现），以 stLastSeen ≥ 本轮扫描开始时刻 或 当前已连接
+//!    判定真实在场。
 
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::time::Duration;
 use serde::Serialize;
 use winapi::shared::minwindef::DWORD;
 use winapi::shared::minwindef::FILETIME;
@@ -22,11 +27,18 @@ use winapi::um::minwinbase::SYSTEMTIME;
 use winapi::um::sysinfoapi::GetSystemTimeAsFileTime;
 use winapi::um::timezoneapi::SystemTimeToFileTime;
 use winapi::um::winnt::HANDLE;
+use windows::core::AgileReference;
+use windows::core::HSTRING;
+use windows::Devices::Bluetooth::GenericAttributeProfile::GattSession;
+use windows::Devices::Bluetooth::{BluetoothConnectionStatus, BluetoothLEDevice};
+use windows::Devices::Enumeration::DeviceInformation;
 
 /// EPOCH_FILETIME ticks 与 Unix 毫秒的差值（1601-01-01 → 1970-01-01）
 const FILETIME_TO_UNIX_MS: u64 = 11_644_473_600_000;
 /// stLastSeen 判定余量：栈写入时间戳可能略早于我们的开始时刻
 const SEEN_GRACE_MS: u64 = 2_000;
+/// 首次建立系统连接时等待连接恢复的时长（手机在范围内通常 1~3 秒连上）
+const LINK_WAIT_MS: u64 = 4_000;
 
 /// 扫描结果中的单个蓝牙设备
 #[derive(Debug, Clone, Serialize)]
@@ -38,6 +50,8 @@ pub struct BtDevice {
     pub connected: bool,
     /// 真实在场：本轮 inquiry 听到，或当前已连接（缓存设备为 false）
     pub in_range: bool,
+    /// 是否为本机已配对设备
+    pub paired: bool,
 }
 
 fn from_wide(buf: &[u16]) -> String {
@@ -92,6 +106,174 @@ pub fn device_matches(name: &str, address: &str, matcher: &str) -> bool {
     name.to_lowercase().contains(&m)
 }
 
+/// 从 BLE DeviceInformation.Id 解析远端 MAC。
+/// 形如 `BluetoothLE#BluetoothLE00:1a:7d:da:71:13-0c:f3:ee:4c:f6:73`，取 '-' 之后一段。
+pub fn parse_le_id(id: &str) -> Option<String> {
+    let after = id.split('#').nth(1)?;
+    let remote = after.split('-').nth(1)?;
+    let hex: String = remote.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    if hex.len() == 12 {
+        Some(hex.to_lowercase())
+    } else {
+        None
+    }
+}
+
+/* ===================== ① 系统连接直读（已配对设备） ===================== */
+
+/// 已建立的系统维持连接（session 对象必须存活，MaintainConnection 才持续生效）
+pub struct BtLink {
+    device: AgileReference<BluetoothLEDevice>,
+    _session: AgileReference<GattSession>,
+    pub name: String,
+    pub address: String,
+}
+
+static LINK: OnceLock<Mutex<Option<(String, BtLink)>>> = OnceLock::new();
+
+fn fe(v: impl std::fmt::Display) -> String {
+    format!("Windows 蓝牙 API 调用失败：{v}")
+}
+
+/// 枚举本机已配对的 BLE 设备（名称、MAC、原始 Id）
+pub fn paired_ble_devices() -> Result<Vec<(String, String, String)>, String> {
+    let selector = BluetoothLEDevice::GetDeviceSelectorFromPairingState(true).map_err(fe)?;
+    let coll = DeviceInformation::FindAllAsyncAqsFilter(&selector)
+        .map_err(fe)?
+        .get()
+        .map_err(fe)?;
+    let n = coll.Size().map_err(fe)?;
+    let mut out = Vec::new();
+    for i in 0..n {
+        let info = coll.GetAt(i).map_err(fe)?;
+        let name = info.Name().map_err(fe)?.to_string();
+        let id = info.Id().map_err(fe)?.to_string();
+        let addr = parse_le_id(&id).unwrap_or_default();
+        out.push((name, addr, id));
+    }
+    Ok(out)
+}
+
+/// 为匹配的已配对设备建立系统维持连接；未找到返回 None
+pub fn prepare_link(matcher: &str) -> Result<Option<BtLink>, String> {
+    for (name, addr, id) in paired_ble_devices()? {
+        if device_matches(&name, &addr, matcher) {
+            let dev = BluetoothLEDevice::FromIdAsync(&HSTRING::from(id))
+                .map_err(fe)?
+                .get()
+                .map_err(fe)?;
+            let devid = dev.BluetoothDeviceId().map_err(fe)?;
+            let session = GattSession::FromDeviceIdAsync(&devid)
+                .map_err(fe)?
+                .get()
+                .map_err(fe)?;
+            session.SetMaintainConnection(true).map_err(fe)?;
+            return Ok(Some(BtLink {
+                device: AgileReference::new(&dev).map_err(fe)?,
+                _session: AgileReference::new(&session).map_err(fe)?,
+                name,
+                address: addr,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// 读取系统连接状态：手机在蓝牙范围内 = Connected
+pub fn link_connected(link: &BtLink) -> Result<bool, String> {
+    let dev = link.device.resolve().map_err(fe)?;
+    Ok(dev.ConnectionStatus().map_err(fe)? == BluetoothConnectionStatus::Connected)
+}
+
+/// 目标是否存在已配对设备（用于提示检测模式）
+pub fn paired_match_exists(matcher: &str) -> Result<bool, String> {
+    for (name, addr, _id) in paired_ble_devices()? {
+        if device_matches(&name, &addr, matcher) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// 汇总扫描：已配对设备（含连接状态）+ inquiry 真实在场设备（去重）
+pub fn scan_all(timeout_mult: u32) -> Result<Vec<BtDevice>, String> {
+    let mut out: Vec<BtDevice> = Vec::new();
+    if let Ok(pairs) = paired_ble_devices() {
+        for (name, addr, id) in pairs {
+            let connected = BluetoothLEDevice::FromIdAsync(&HSTRING::from(id))
+                .map(|op| op.get().ok())
+                .ok()
+                .flatten()
+                .and_then(|d| d.ConnectionStatus().ok())
+                .map(|s| s == BluetoothConnectionStatus::Connected)
+                .unwrap_or(false);
+            out.push(BtDevice {
+                name,
+                address: addr,
+                connected,
+                in_range: true,
+                paired: true,
+            });
+        }
+    }
+    if let Ok(devs) = inquiry(timeout_mult) {
+        for d in devs {
+            if d.in_range && !out.iter().any(|x| x.address == d.address) {
+                out.push(BtDevice { paired: false, ..d });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// 判断目标设备是否真实在附近。
+/// 优先走系统连接直读（已配对），未配对时退回经典 inquiry 扫描。
+pub fn presence(matcher: &str, timeout_mult: u32) -> Result<bool, String> {
+    let key = matcher.trim().to_string();
+    if key.is_empty() {
+        return Err("未指定要监控的蓝牙设备（名称或 MAC）".into());
+    }
+    let lock = LINK.get_or_init(|| Mutex::new(None));
+    let mut guard = lock.lock().unwrap();
+    let need_new = match guard.as_ref() {
+        Some((k, _)) => *k != key,
+        None => true,
+    };
+    if need_new {
+        *guard = None; // 释放旧目标连接（对象丢弃即断开维持）
+        if let Some(link) = prepare_link(matcher)? {
+            // 给系统一点时间建立/恢复连接：手机在范围内会自动连上
+            let deadline = std::time::Instant::now() + Duration::from_millis(LINK_WAIT_MS);
+            while std::time::Instant::now() < deadline {
+                if link_connected(&link).unwrap_or(false) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(400));
+            }
+            *guard = Some((key, link));
+        }
+    }
+    if let Some((_, link)) = guard.as_ref() {
+        return link_connected(link);
+    }
+    drop(guard);
+    // 未配对 → 兜底：经典 inquiry（仅「可被发现」设备可见）
+    Ok(inquiry(timeout_mult)?
+        .iter()
+        .any(|d| d.in_range && device_matches(&d.name, &d.address, matcher)))
+}
+
+/// 当前系统维持连接绑定的目标（名称, MAC）；未绑定时返回 None
+pub fn link_target() -> Option<(String, String)> {
+    LINK.get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|(_, l)| (l.name.clone(), l.address.clone()))
+}
+
+/* ===================== ② 经典查询扫描（兜底） ===================== */
+
 /// 执行一轮蓝牙设备查询。耗时约 timeout_mult × 1.28 秒。
 /// 返回发现的全部设备（含缓存，用 in_range 区分真实在场）；无适配器时返回 Err。
 pub fn inquiry(timeout_mult: u32) -> Result<Vec<BtDevice>, String> {
@@ -141,6 +323,7 @@ pub fn inquiry(timeout_mult: u32) -> Result<Vec<BtDevice>, String> {
                 address: format!("{:012x}", di.Address),
                 connected,
                 in_range: connected || heard_now,
+                paired: di.fAuthenticated != 0,
             });
             if BluetoothFindNextDevice(h_find, &mut di) == 0 {
                 break;
@@ -150,17 +333,6 @@ pub fn inquiry(timeout_mult: u32) -> Result<Vec<BtDevice>, String> {
         CloseHandle(h_radio);
         Ok(out)
     }
-}
-
-/// 判断目标设备是否真实在附近（在场 + 名称或 MAC 匹配）
-pub fn presence(matcher: &str, timeout_mult: u32) -> Result<bool, String> {
-    let m = matcher.trim();
-    if m.is_empty() {
-        return Err("未指定要监控的蓝牙设备（名称或 MAC）".into());
-    }
-    Ok(inquiry(timeout_mult)?
-        .iter()
-        .any(|d| d.in_range && device_matches(&d.name, &d.address, m)))
 }
 
 #[cfg(test)]
@@ -176,14 +348,8 @@ mod tests {
 
     #[test]
     fn mac_normalize() {
-        assert_eq!(
-            normalize_mac("A4:C1:38:11:22:33").as_deref(),
-            Some("a4c138112233")
-        );
-        assert_eq!(
-            normalize_mac("a4-c1-38-11-22-33").as_deref(),
-            Some("a4c138112233")
-        );
+        assert_eq!(normalize_mac("A4:C1:38:11:22:33").as_deref(), Some("a4c138112233"));
+        assert_eq!(normalize_mac("a4-c1-38-11-22-33").as_deref(), Some("a4c138112233"));
         assert_eq!(normalize_mac("a4c138112233").as_deref(), Some("a4c138112233"));
         assert_eq!(normalize_mac("Xiaomi 14"), None);
         assert_eq!(normalize_mac("172.30.109.238"), None);
@@ -198,6 +364,17 @@ mod tests {
         assert!(!device_matches("Other Phone", "001122334455", "a4:c1:38:11:22:33"));
         assert!(!device_matches("Xiaomi 14", "a4c138112233", ""));
         assert!(!device_matches("Xiaomi 14", "a4c138112233", "iphone"));
+    }
+
+    #[test]
+    fn le_id_parse() {
+        let id = "BluetoothLE#BluetoothLE00:1a:7d:da:71:13-0c:f3:ee:4c:f6:73";
+        assert_eq!(parse_le_id(id).as_deref(), Some("0cf3ee4cf673"));
+        assert_eq!(parse_le_id(" nonsense "), None);
+        assert_eq!(
+            parse_le_id("BluetoothLE#BluetoothLEaa:bb-11:22:33:44:55:66").as_deref(),
+            Some("112233445566")
+        );
     }
 
     #[test]
@@ -227,6 +404,18 @@ mod tests {
                 println!("蓝牙扫描成功：共 {} 个条目，其中在场 {} 个", devs.len(), in_range);
             }
             Err(e) => println!("蓝牙扫描不可用（本机无适配器属预期）：{e}"),
+        }
+    }
+
+    /// 汇总扫描冒烟：已配对枚举 + inquiry 合并
+    #[test]
+    fn scan_all_smoke() {
+        match scan_all(1) {
+            Ok(devs) => {
+                let paired = devs.iter().filter(|d| d.paired).count();
+                println!("汇总扫描：{} 个设备（已配对 {} 个）", devs.len(), paired);
+            }
+            Err(e) => println!("汇总扫描不可用（无适配器属预期）：{e}"),
         }
     }
 }

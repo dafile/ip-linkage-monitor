@@ -1,6 +1,6 @@
 [package]
 name = "ip-linkage-monitor"
-version = "1.3.1"
+version = "1.4.0"
 description = "掌上看家联动IP在线状态监控"
 edition = "2021"
 
@@ -27,6 +27,13 @@ winapi = { version = "0.3", features = [
     "sysinfoapi",
     "timezoneapi",
     "minwinbase",
+] }
+windows = { version = "0.58", features = [
+    "Devices_Bluetooth",
+    "Devices_Bluetooth_GenericAttributeProfile",
+    "Devices_Enumeration",
+    "Foundation",
+    "Foundation_Collections",
 ] }
 
 [profile.release]
