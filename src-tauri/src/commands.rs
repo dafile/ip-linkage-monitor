@@ -468,6 +468,7 @@ pub fn hide_program_window(state: State<'_, Arc<AppState>>) -> Result<usize, Str
 }
 
 #[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TestIpResult {
     pub online: bool,
     pub latency_ms: u64,
@@ -508,6 +509,7 @@ pub async fn run_action(
 /* ===================== 检测测试（IP / 蓝牙） ===================== */
 
 #[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MonitorTestResult {
     pub online: bool,
     pub latency_ms: u64,
@@ -554,6 +556,7 @@ pub async fn test_monitor(state: State<'_, Arc<AppState>>) -> Result<MonitorTest
 }
 
 #[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BtTestResult {
     pub online: bool,
     pub duration_ms: u64,
@@ -584,15 +587,7 @@ pub async fn test_bluetooth(device: String, timeout_mult: u32) -> Result<BtTestR
         .map_err(|e| e.to_string())??;
     let duration = t0.elapsed().as_millis() as u64;
     let mode = if paired { "paired" } else { "scan" };
-    let bound = bluetooth::link_target().map(|(n, a)| {
-        let mac = a
-            .as_bytes()
-            .chunks(2)
-            .map(|c| String::from_utf8_lossy(c).to_string())
-            .collect::<Vec<_>>()
-            .join(":");
-        format!("{n} ({mac})")
-    });
+    let bound = bluetooth::link_target().map(|(n, a)| format!("{n} ({})", bluetooth::mac_colon(&a)));
     logger::log(
         INFO,
         CAT_USER,
@@ -607,6 +602,7 @@ pub async fn test_bluetooth(device: String, timeout_mult: u32) -> Result<BtTestR
 }
 
 #[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BtScanList {
     pub devices: Vec<bluetooth::BtDevice>,
     pub duration_ms: u64,
@@ -705,6 +701,7 @@ pub fn get_logs(state: State<'_, Arc<AppState>>, filter: LogFilter) -> Vec<LogEn
 }
 
 #[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ExportResult {
     pub count: usize,
     pub path: String,
