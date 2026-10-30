@@ -100,6 +100,9 @@ pub struct Config {    /// 监控程序（掌上看家采集端）exe 路径，�
     pub poll_interval_sec: u32,
     /// Ping 超时（毫秒）
     pub ping_timeout_ms: u32,
+    /// 离线确认时间（秒）：连续不可达达到该时长才判定离线，
+    /// 避免蓝牙/WiFi 单次探测失败造成误离线并误触发联动
+    pub offline_confirm_sec: u32,
     /// 联动规则列表
     pub rules: Vec<LinkageRule>,
     /// 是否已完成默认规则播种（避免用户删光规则后被再次生成）
@@ -119,6 +122,7 @@ impl Default for Config {
             close_to_tray: true,
             poll_interval_sec: 3,
             ping_timeout_ms: 2000,
+            offline_confirm_sec: 30,
             rules: Vec::new(),
             rules_seeded: false,
         }

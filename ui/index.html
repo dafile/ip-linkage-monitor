@@ -333,7 +333,7 @@
     <div class="logo"></div>
     <div>
       <h1>掌上看家联动 IP 在线状态监控</h1>
-      <div class="sub">IP Linkage Monitor v1.4.1</div>
+      <div class="sub">IP Linkage Monitor v1.5.0</div>
     </div>
     <div class="spacer"></div>
     <div class="top-pills">
@@ -552,6 +552,19 @@
                 <option value="1000">1 秒</option><option value="2000">2 秒</option>
                 <option value="3000">3 秒</option><option value="5000">5 秒</option>
               </select>
+            </div>
+          </div>
+          <div class="form-row">
+            <label>离线确认</label>
+            <div class="control">
+              <select id="selOfflineConfirm">
+                <option value="0">不确认（最快，易误判）</option>
+                <option value="10">10 秒</option>
+                <option value="20">20 秒</option>
+                <option value="30">30 秒（推荐）</option>
+                <option value="60">60 秒</option>
+              </select>
+              <span class="form-note" style="margin:0">连续不可达达到该时长才判定离线；单次蓝牙寻呼/WiFi 抖动不会触发联动</span>
             </div>
           </div>
           <div class="form-row" style="margin-bottom:0">
@@ -784,6 +797,15 @@ function renderSettings() {
   $("selPoll").value = String(cfg.poll_interval_sec);
   $("selTimeout").value = String(cfg.ping_timeout_ms);
   $("selBtTimeout").value = String(cfg.bt_scan_timeout_mult || 4);
+  const confirmSel = $("selOfflineConfirm");
+  const confirmVal = String(cfg.offline_confirm_sec ?? 30);
+  if (!Array.from(confirmSel.options).some(o => o.value === confirmVal)) {
+    const opt = document.createElement("option");
+    opt.value = confirmVal;
+    opt.textContent = `${confirmVal} 秒`;
+    confirmSel.appendChild(opt);
+  }
+  confirmSel.value = confirmVal;
   $("chkHidden").checked = !!cfg.launch_hidden;
   $("chkTray").checked = cfg.close_to_tray !== false;
   applyModeUI();
@@ -802,9 +824,11 @@ function renderStatusHints() {
   if (!cfg) return;
   const bt = cfg.monitor_mode === "bluetooth";
   $("ipAddrText").textContent = bt ? (cfg.bt_device || "（未配置蓝牙设备）") : (cfg.monitor_ip || "（未配置 IP）");
+  const confirmSec = cfg.offline_confirm_sec ?? 30;
+  const confirmHint = confirmSec > 0 ? `；离线需连续确认 ${confirmSec} 秒` : "";
   $("ipPollHint").textContent = bt
-    ? `蓝牙扫描约 ${Math.round((cfg.bt_scan_timeout_mult || 4) * 1.28)} 秒 + 间隔 ${cfg.poll_interval_sec} 秒`
-    : `每 ${cfg.poll_interval_sec} 秒自动检测`;
+    ? `蓝牙扫描约 ${Math.round((cfg.bt_scan_timeout_mult || 4) * 1.28)} 秒 + 间隔 ${cfg.poll_interval_sec} 秒${confirmHint}`
+    : `每 ${cfg.poll_interval_sec} 秒自动检测${confirmHint}`;
   const needPath = cfg.rules.some(r => r.enabled && r.action.type !== "run_command");
   $("setupBanner").classList.toggle("show", needPath && !cfg.program_path);
   $("progPathView").textContent = cfg.program_path ? cfg.program_path : "";
@@ -1161,6 +1185,7 @@ $("btnIpTest").addEventListener("click", async () => {
 
 $("selPoll").addEventListener("change", () => { cfg.poll_interval_sec = +$("selPoll").value; scheduleSave(); renderStatusHints(); });
 $("selTimeout").addEventListener("change", () => { cfg.ping_timeout_ms = +$("selTimeout").value; scheduleSave(); });
+$("selOfflineConfirm").addEventListener("change", () => { cfg.offline_confirm_sec = +$("selOfflineConfirm").value; scheduleSave(); renderStatusHints(); });
 $("chkHidden").addEventListener("change", () => { cfg.launch_hidden = $("chkHidden").checked; scheduleSave(); });
 $("chkTray").addEventListener("change", () => { cfg.close_to_tray = $("chkTray").checked; scheduleSave(); });
 
@@ -1223,8 +1248,8 @@ $("btnBtTest").addEventListener("click", async () => {
   el.className = "inline-result"; el.textContent = "蓝牙检测中…（5~20 秒）";
   try {
     const r = await invoke("test_bluetooth", { device: dev, timeoutMult: cfg.bt_scan_timeout_mult || 4 });
-    el.className = r.online ? "inline-result online" : "inline-result offline";
-    el.textContent = `${r.online ? "● 在线" : "○ 离线"}（${r.detail}）（${r.durationMs} ms）`;
+    el.className = r.confirmed === false ? "inline-result" : (r.online ? "inline-result online" : "inline-result offline");
+    el.textContent = `${r.confirmed === false ? "⚠ 无法确认" : (r.online ? "● 在线" : "○ 离线")}（${r.detail}）（${r.durationMs} ms）`;
   } catch (e) {
     el.className = "inline-result offline"; el.textContent = e;
   }
@@ -1308,8 +1333,14 @@ $("btnTestNow").addEventListener("click", async () => {
   const t0 = performance.now();
   try {
     const r = await invoke("test_monitor");
-    applyIpView(r.online, Math.round(performance.now() - t0), "刚刚");
-    if (r.mode === "bluetooth") toast(r.online ? "蓝牙检测：目标在线" : "蓝牙检测：未发现目标", r.online ? "success" : "");
+    if (r.confirmed === false) {
+      $("ipStateWord").textContent = "无法确认";
+      $("ipStateWord").className = "state-word";
+      toast(`检测无法确认：${r.detail}`, "", 6000);
+    } else {
+      applyIpView(r.online, Math.round(performance.now() - t0), "刚刚");
+      if (r.mode === "bluetooth") toast(r.online ? "蓝牙检测：目标在线" : "蓝牙检测：未发现目标", r.online ? "success" : "");
+    }
   } catch (e) { toast(e, "error"); }
   setTimeout(refreshStatus, 800);
 });
@@ -1365,6 +1396,10 @@ async function refreshStatus() {
       $("pillIpText").textContent = s.monitorMode === "bluetooth" ? "蓝牙未配置" : "IP 未配置";
     } else {
       applyIpView(s.ipOnline, s.latencyMs, s.ipLastCheck);
+      if (s.offlineConfirming && s.ipOnline) {
+        $("ipStateWord").textContent = `在 线（离线确认中 ${s.offlineConfirmRemainingSec ?? 0}s）`;
+        $("pillIpText").textContent = (s.monitorMode === "bluetooth" ? "蓝牙" : "IP ") + "在线·确认中";
+      }
     }
     $("ipLastChange").textContent = s.lastTransition || "—";
 
@@ -1502,6 +1537,7 @@ $("btnClear").addEventListener("click", async () => {
       program_path: "", monitor_ip: "172.30.109.238", monitor_mode: "ip",
       bt_device: "", bt_scan_timeout_mult: 4, linkage_enabled: false,
       launch_hidden: true, close_to_tray: true, poll_interval_sec: 3, ping_timeout_ms: 2000,
+      offline_confirm_sec: 30,
       rules: [], rules_seeded: true,
     };
   }

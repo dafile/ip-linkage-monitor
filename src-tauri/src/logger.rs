@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use tauri::{AppHandle, Emitter};
 
 pub const INFO: &str = "INFO";
@@ -17,6 +17,9 @@ pub const CAT_CONFIG: &str = "配置";
 
 static APP: OnceLock<AppHandle> = OnceLock::new();
 static LOGS_DIR: OnceLock<PathBuf> = OnceLock::new();
+/// 文件写入锁：多线程并发写同一日志文件会导致行粘连（两个 JSON 粘成一行，
+/// 日志查看器解析失败丢行）。所有写入必须串行。
+static WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
@@ -41,8 +44,11 @@ pub fn log(level: &str, category: &str, message: &str) {
     };
     if let Some(dir) = LOGS_DIR.get() {
         let file = dir.join(format!("log-{}.jsonl", Local::now().format("%Y%m%d")));
+        let line = serde_json::to_string(&entry).unwrap_or_default();
+        // 串行化写入，避免多线程并发 append 造成行粘连
+        let _guard = WRITE_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&file) {
-            let _ = writeln!(f, "{}", serde_json::to_string(&entry).unwrap_or_default());
+            let _ = writeln!(f, "{line}");
         }
     }
     if let Some(app) = APP.get() {

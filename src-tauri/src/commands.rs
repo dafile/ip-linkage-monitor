@@ -48,6 +48,7 @@ fn validate_and_normalize(cfg: &mut Config) -> Result<(), String> {
     cfg.program_path = cfg.program_path.trim().trim_matches('"').to_string();
     cfg.poll_interval_sec = cfg.poll_interval_sec.clamp(1, 60);
     cfg.ping_timeout_ms = cfg.ping_timeout_ms.clamp(200, 10000);
+    cfg.offline_confirm_sec = cfg.offline_confirm_sec.min(600);
     if cfg.monitor_mode != "bluetooth" {
         cfg.monitor_mode = "ip".to_string();
     }
@@ -99,6 +100,7 @@ pub fn set_config(
     let mut changes: Vec<String> = Vec::new();
     let linkage_turned_off;
     let linkage_changed_to;
+    let target_changed;
     {
         let mut old = state.config.lock().unwrap();
         if old.program_path != new_cfg.program_path {
@@ -160,6 +162,17 @@ pub fn set_config(
                 old.ping_timeout_ms, new_cfg.ping_timeout_ms
             ));
         }
+        if old.offline_confirm_sec != new_cfg.offline_confirm_sec {
+            changes.push(format!(
+                "离线确认时间 {} → {}",
+                fmt_sec(old.offline_confirm_sec),
+                if new_cfg.offline_confirm_sec == 0 {
+                    "不确认".to_string()
+                } else {
+                    fmt_sec(new_cfg.offline_confirm_sec)
+                }
+            ));
+        }
         if old.rules != new_cfg.rules {
             let total = new_cfg.rules.len();
             let enabled = new_cfg.rules.iter().filter(|r| r.enabled).count();
@@ -173,6 +186,10 @@ pub fn set_config(
         } else {
             None
         };
+        let mode_changed = old.monitor_mode != new_cfg.monitor_mode;
+        target_changed = mode_changed
+            || (new_cfg.monitor_mode == "bluetooth" && old.bt_device != new_cfg.bt_device)
+            || (new_cfg.monitor_mode == "ip" && old.monitor_ip != new_cfg.monitor_ip);
         *old = new_cfg.clone();
     }
     state.save_config()?;
@@ -186,6 +203,27 @@ pub fn set_config(
                 &format!("联动已关闭，取消待执行任务「{}」（{}）", rule_title(&p.note, &p.action), p.action.desc()),
             );
         }
+    }
+    if target_changed {
+        // 旧目标的在线状态不能与新目标比较，否则切换方式/目标会凭空触发一次联动
+        let cancelled = monitor::cancel_pending(&state, None);
+        for p in &cancelled {
+            logger::log(
+                INFO,
+                CAT_CONFIG,
+                &format!(
+                    "监控目标已变更，取消待执行任务「{}」（{}）",
+                    rule_title(&p.note, &p.action),
+                    p.action.desc()
+                ),
+            );
+        }
+        monitor::reset_monitor(&state);
+        logger::log(
+            INFO,
+            CAT_CONFIG,
+            "监控目标/方式已变更，已重置在线状态（首次检测只记录，不触发联动）",
+        );
     }
     if let Some(v) = linkage_changed_to {
         sync_tray_linkage(&app, v);
@@ -512,8 +550,11 @@ pub async fn run_action(
 #[serde(rename_all = "camelCase")]
 pub struct MonitorTestResult {
     pub online: bool,
+    /// false = 探测异常/无法确认（界面不要显示成“离线”）
+    pub confirmed: bool,
     pub latency_ms: u64,
     pub mode: String,
+    pub detail: String,
 }
 
 /// 控制台「立即检测」：按当前监控方式执行一次检测
@@ -528,17 +569,34 @@ pub async fn test_monitor(state: State<'_, Arc<AppState>>) -> Result<MonitorTest
         let mult = cfg.bt_scan_timeout_mult.clamp(1, 48);
         logger::log(INFO, CAT_USER, &format!("手动立即检测：蓝牙扫描「{dev}」…"));
         let t0 = Instant::now();
-        let online =
-            tauri::async_runtime::spawn_blocking(move || bluetooth::presence(&dev, mult))
-                .await
-                .map_err(|e| e.to_string())??;
+        let d = tauri::async_runtime::spawn_blocking(move || {
+            bluetooth::presence_detail(&dev, mult)
+        })
+        .await
+        .map_err(|e| e.to_string())??;
         let ms = t0.elapsed().as_millis() as u64;
+        let detail = d.summary();
         logger::log(
             INFO,
             CAT_USER,
-            &format!("手动蓝牙检测结果：{}（{ms} ms）", if online { "在线" } else { "未发现" }),
+            &format!(
+                "手动蓝牙检测结果：{}（{ms} ms）；{detail}",
+                if !d.confirmed {
+                    "无法确认"
+                } else if d.online {
+                    "在线"
+                } else {
+                    "未发现"
+                }
+            ),
         );
-        Ok(MonitorTestResult { online, latency_ms: ms, mode: "bluetooth".into() })
+        Ok(MonitorTestResult {
+            online: d.online,
+            confirmed: d.confirmed,
+            latency_ms: ms,
+            mode: "bluetooth".into(),
+            detail,
+        })
     } else {
         if cfg.monitor_ip.trim().is_empty() {
             return Err("未配置监控 IP".into());
@@ -551,7 +609,13 @@ pub async fn test_monitor(state: State<'_, Arc<AppState>>) -> Result<MonitorTest
             .await
             .map_err(|e| e.to_string())?;
         let ms = t0.elapsed().as_millis() as u64;
-        Ok(MonitorTestResult { online, latency_ms: ms, mode: "ip".into() })
+        Ok(MonitorTestResult {
+            online,
+            confirmed: true,
+            latency_ms: ms,
+            mode: "ip".into(),
+            detail: format!("Ping {}", if online { "有响应" } else { "超时/不可达" }),
+        })
     }
 }
 
@@ -559,6 +623,8 @@ pub async fn test_monitor(state: State<'_, Arc<AppState>>) -> Result<MonitorTest
 #[serde(rename_all = "camelCase")]
 pub struct BtTestResult {
     pub online: bool,
+    /// false = 探测异常/无法确认
+    pub confirmed: bool,
     pub duration_ms: u64,
     /// paired = 已配对多通道；scan = 主动扫描（未配对兜底）
     pub mode: String,
@@ -589,36 +655,32 @@ pub async fn test_bluetooth(device: String, timeout_mult: u32) -> Result<BtTestR
         .map_err(|e| e.to_string())??;
     let duration = t0.elapsed().as_millis() as u64;
     let bound = bluetooth::link_target().map(|(n, a)| format!("{n} ({})", bluetooth::mac_colon(&a)));
-    let detail = if d.mode == "paired" {
-        let mut parts = vec![format!("BLE维持连接：{}", if d.ble_connected { "已连接" } else { "未连接" })];
-        if d.classic_connected {
-            parts.push("经典档案连接：在连接".into());
-        }
-        if let Some(p) = d.probe {
-            parts.push(format!(
-                "定向探测：{}",
-                if p { "可达（手机在附近）" } else { "不可达（不在范围或蓝牙已关）" }
-            ));
-        }
-        if let Some(b) = bound {
-            parts.push(format!("绑定 {b}"));
-        }
-        parts.join("；")
-    } else {
-        format!(
-            "主动扫描：{}（未配对设备仅「可被发现」时可见）",
-            if d.scanned == Some(true) { "发现目标" } else { "未发现目标" }
-        )
-    };
+    let mut parts = vec![d.summary()];
+    if let Some(b) = bound {
+        parts.push(format!("绑定 {b}"));
+    }
+    let detail = parts.join("；");
     logger::log(
         INFO,
         CAT_USER,
         &format!(
             "蓝牙检测结果：{}（{duration} ms）{detail}",
-            if d.online { "在线" } else { "离线" }
+            if !d.confirmed {
+                "无法确认"
+            } else if d.online {
+                "在线"
+            } else {
+                "离线"
+            }
         ),
     );
-    Ok(BtTestResult { online: d.online, duration_ms: duration, mode: d.mode, detail })
+    Ok(BtTestResult {
+        online: d.online,
+        confirmed: d.confirmed,
+        duration_ms: duration,
+        mode: d.mode,
+        detail,
+    })
 }
 
 #[derive(serde::Serialize)]
@@ -698,6 +760,8 @@ pub fn import_config(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<
     }
     // 导入的规则可能与排期中的任务不一致，全部取消
     let cancelled = monitor::cancel_pending(&state, None);
+    // 导入配置可能更换监控目标/方式，旧状态不能沿用
+    monitor::reset_monitor(&state);
     state.save_config()?;
     sync_tray_linkage(&app, cfg.linkage_enabled);
     logger::log(

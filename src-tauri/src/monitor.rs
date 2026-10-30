@@ -9,6 +9,7 @@ use chrono::Local;
 use serde::Serialize;
 use std::path::Path;
 use std::process::Command;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::AppHandle;
@@ -21,6 +22,8 @@ const STAY_DEAD_SECS: u64 = 15;
 const MAX_RESPAWN_KILLS: u32 = 6;
 /// 联动任务到期检查精度
 const FIRE_CHECK_INTERVAL: Duration = Duration::from_millis(250);
+/// 检测结果“无法确认”时的日志限流间隔
+const UNKNOWN_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -33,6 +36,9 @@ pub struct Status {
     pub program_path_exists: bool,
     pub linkage_enabled: bool,
     pub monitor_mode: String,
+    /// 已进入离线确认（尚未判定离线）
+    pub offline_confirming: bool,
+    pub offline_confirm_remaining_sec: u64,
     pub pendings: Vec<PendingDto>,
     pub monitor_alive: bool,
 }
@@ -45,6 +51,13 @@ pub struct PendingDto {
     pub action_desc: String,
     pub due_ts: String,
     pub remaining_sec: u64,
+}
+
+/// 一次检测的结论（confirmed=false 表示探测异常/无法确认，不能当作离线）
+struct Detection {
+    online: bool,
+    confirmed: bool,
+    detail: String,
 }
 
 /// 已排期的联动任务
@@ -60,23 +73,37 @@ pub struct PendingAction {
 
 /// 监控线程的运行时状态（非持久化）
 pub struct MonitorInner {
+    /// 目标/模式变更代数：变更后丢弃旧目标的在途检测结果
+    pub generation: u64,
     pub last_tick: Instant,
     pub ip_online: Option<bool>,
     pub ip_last_check: Option<String>,
     pub latency_ms: Option<u64>,
     pub last_transition: Option<String>,
     pub pending: Vec<PendingAction>,
+    /// 连续不可达的起点（用于离线确认窗口）
+    pub offline_since: Option<Instant>,
+    /// 离线确认窗口内收到的“明确不可达”次数
+    pub offline_confirm_hits: u32,
+    /// “无法确认”日志限流
+    pub unknown_log_at: Option<Instant>,
+    pub unknown_count: u32,
 }
 
 impl MonitorInner {
     pub fn new() -> Self {
         Self {
+            generation: 0,
             last_tick: Instant::now(),
             ip_online: None,
             ip_last_check: None,
             latency_ms: None,
             last_transition: None,
             pending: Vec::new(),
+            offline_since: None,
+            offline_confirm_hits: 0,
+            unknown_log_at: None,
+            unknown_count: 0,
         }
     }
 }
@@ -99,6 +126,7 @@ pub fn spawn_thread(_app: AppHandle, state: Arc<AppState>) {
         let mut scan_errors: u32 = 0;
         loop {
             let cfg = state.config_snapshot();
+            let generation = state.monitor.lock().unwrap().generation;
             let bt_mode = cfg.monitor_mode == "bluetooth";
             let target_ok = if bt_mode {
                 !cfg.bt_device.trim().is_empty()
@@ -108,6 +136,10 @@ pub fn spawn_thread(_app: AppHandle, state: Arc<AppState>) {
 
             if !target_ok {
                 let mut m = state.monitor.lock().unwrap();
+                if m.generation != generation {
+                    drop(m);
+                    continue;
+                }
                 m.last_tick = Instant::now();
                 m.ip_online = None;
                 m.ip_last_check = Some(now_ts());
@@ -115,12 +147,21 @@ pub fn spawn_thread(_app: AppHandle, state: Arc<AppState>) {
                 drop(m);
             } else {
                 let t0 = Instant::now();
-                let scan: Result<bool, String> = if bt_mode {
+                let scan: Result<Detection, String> = if bt_mode {
                     let dev = cfg.bt_device.trim().to_string();
-                    bluetooth::presence(&dev, cfg.bt_scan_timeout_mult)
+                    bluetooth::presence_detail(&dev, cfg.bt_scan_timeout_mult).map(|d| Detection {
+                        online: d.online,
+                        confirmed: d.confirmed,
+                        detail: d.summary(),
+                    })
                 } else {
                     let ip = cfg.monitor_ip.trim().to_string();
-                    Ok(netcheck::ping_once(&ip, cfg.ping_timeout_ms))
+                    let online = netcheck::ping_once(&ip, cfg.ping_timeout_ms);
+                    Ok(Detection {
+                        online,
+                        confirmed: true,
+                        detail: format!("Ping {}", if online { "有响应" } else { "超时/不可达" }),
+                    })
                 };
                 let latency = t0.elapsed().as_millis() as u64;
 
@@ -137,11 +178,15 @@ pub fn spawn_thread(_app: AppHandle, state: Arc<AppState>) {
                             );
                         }
                         let mut m = state.monitor.lock().unwrap();
+                        if m.generation != generation {
+                            drop(m);
+                            continue;
+                        }
                         m.last_tick = Instant::now();
                         m.ip_last_check = Some(now_ts());
                         drop(m);
                     }
-                    Ok(online) => {
+                    Ok(d) => {
                         if scan_errors > 0 {
                             logger::log(INFO, CAT_MONITOR, "检测已恢复正常");
                             scan_errors = 0;
@@ -151,7 +196,15 @@ pub fn spawn_thread(_app: AppHandle, state: Arc<AppState>) {
                         } else {
                             format!("IP {}", cfg.monitor_ip.trim())
                         };
-                        handle_presence(&state, &cfg, online, latency, &subject);
+                        handle_presence(
+                            &state,
+                            d.online,
+                            d.confirmed,
+                            generation,
+                            latency,
+                            &subject,
+                            &d.detail,
+                        );
                     }
                 }
             }
@@ -162,31 +215,133 @@ pub fn spawn_thread(_app: AppHandle, state: Arc<AppState>) {
 }
 
 /// 处理一次成功的检测结果：更新状态、记录首检、触发联动
-fn handle_presence(state: &Arc<AppState>, cfg: &Config, online: bool, latency_ms: u64, subject: &str) {
+fn handle_presence(
+    state: &Arc<AppState>,
+    online: bool,
+    confirmed: bool,
+    generation: u64,
+    latency_ms: u64,
+    subject: &str,
+    detail: &str,
+) {
+    // 用当前配置而不是检测开始时的旧快照：检测可能耗时十几秒，
+    // 期间用户可能关闭联动/修改确认时间
+    let cfg = state.config_snapshot();
     let mut transition: Option<bool> = None;
     let mut first_result = false;
+    let mut confirm_started = false;
+    let mut confirm_cancelled = false;
+    let mut unknown_to_log: Option<(u32, bool)> = None;
     {
         let mut m = state.monitor.lock().unwrap();
+        if m.generation != generation {
+            return; // 检测期间目标/模式已变更，丢弃旧结果
+        }
         m.last_tick = Instant::now();
         m.ip_last_check = Some(now_ts());
         m.latency_ms = Some(latency_ms);
-        match m.ip_online {
-            Some(prev) if prev != online => transition = Some(online),
-            None => first_result = true,
-            _ => {}
+        if !confirmed {
+            // 探测超时/API 异常：保持原状态，绝不能当作离线
+            m.unknown_count += 1;
+            let should_log = match m.unknown_log_at {
+                None => true,
+                Some(t) => t.elapsed() >= UNKNOWN_LOG_INTERVAL,
+            };
+            if should_log {
+                m.unknown_log_at = Some(Instant::now());
+            }
+            unknown_to_log = Some((m.unknown_count, should_log));
+        } else {
+            m.unknown_count = 0;
+            m.unknown_log_at = None;
+            match m.ip_online {
+                None => {
+                    // 首次检测只记录，不触发联动
+                    m.ip_online = Some(online);
+                    m.offline_since = None;
+                    m.offline_confirm_hits = 0;
+                    first_result = true;
+                }
+                Some(prev) if prev == online => {
+                    if online && m.offline_since.is_some() {
+                        confirm_cancelled = true;
+                    }
+                    m.offline_since = None;
+                    m.offline_confirm_hits = 0;
+                }
+                Some(true) if !online => {
+                    let confirm = cfg.offline_confirm_sec.min(600);
+                    if confirm == 0 {
+                        m.ip_online = Some(false);
+                        m.offline_since = None;
+                        m.offline_confirm_hits = 0;
+                        transition = Some(false);
+                    } else {
+                        m.offline_confirm_hits = m.offline_confirm_hits.saturating_add(1);
+                        match m.offline_since {
+                            None => {
+                                m.offline_since = Some(Instant::now());
+                                confirm_started = true;
+                            }
+                            Some(t)
+                                if t.elapsed() >= Duration::from_secs(confirm as u64)
+                                    && m.offline_confirm_hits >= 2 =>
+                            {
+                                m.ip_online = Some(false);
+                                m.offline_since = None;
+                                m.offline_confirm_hits = 0;
+                                transition = Some(false);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Some(false) if online => {
+                    m.ip_online = Some(true);
+                    m.offline_since = None;
+                    m.offline_confirm_hits = 0;
+                    transition = Some(true);
+                }
+                _ => {}
+            }
         }
-        m.ip_online = Some(online);
     }
     let word = if online { "在线" } else { "离线" };
+    if let Some((count, true)) = unknown_to_log {
+        logger::log(
+            WARN,
+            CAT_MONITOR,
+            &format!(
+                "检测结果无法确认，保持原状态（连续 {count} 次）：{subject}；{detail}"
+            ),
+        );
+    }
     if first_result {
         logger::log(
             INFO,
             CAT_MONITOR,
-            &format!("初始检测完成：{subject} 当前{word}（{latency_ms} ms）"),
+            &format!("初始检测完成：{subject} 当前{word}（{latency_ms} ms）；{detail}"),
+        );
+    }
+    if confirm_started {
+        logger::log(
+            WARN,
+            CAT_MONITOR,
+            &format!(
+                "目标暂时不可达，开始 {} 秒离线确认（连续确认后才判离线）：{subject}；{detail}",
+                cfg.offline_confirm_sec.min(600)
+            ),
+        );
+    }
+    if confirm_cancelled {
+        logger::log(
+            INFO,
+            CAT_MONITOR,
+            &format!("离线确认取消：目标恢复可达（{subject}）"),
         );
     }
     if let Some(online) = transition {
-        on_transition(state, cfg, online, subject);
+        on_transition(state, &cfg, online, subject, detail);
     }
 }
 
@@ -203,10 +358,20 @@ fn fmt_delay_text(sec: u32) -> String {
 }
 
 /// IP 状态变化处理：作废失效任务，按规则调度新任务
-fn on_transition(state: &Arc<AppState>, cfg: &Config, online: bool, subject: &str) {
+fn on_transition(
+    state: &Arc<AppState>,
+    cfg: &Config,
+    online: bool,
+    subject: &str,
+    detail: &str,
+) {
     let new_trigger = if online { TRIGGER_ONLINE } else { TRIGGER_OFFLINE };
     let word = if online { "上线" } else { "离线" };
-    logger::log(INFO, CAT_MONITOR, &format!("目标状态变化：{subject} 已{word}"));
+    logger::log(
+        INFO,
+        CAT_MONITOR,
+        &format!("目标状态变化：{subject} 已{word}（{detail}）"),
+    );
 
     // 状态反转后，触发条件与新状态不符的待执行任务一律作废
     {
@@ -273,6 +438,34 @@ fn schedule_rule(state: &AppState, rule: &LinkageRule, subject: &str, state_word
 }
 
 /// 到期执行联动任务
+/// 联动任务执行前的最后复核。
+/// 返回 None 表示当前无法确认（超时/API 异常），调用方不应据此取消任务。
+fn verify_current_state(state: &AppState) -> Option<bool> {
+    let cfg = state.config_snapshot();
+    if cfg.monitor_mode == "bluetooth" {
+        let dev = cfg.bt_device.trim();
+        if dev.is_empty() {
+            return None;
+        }
+        match bluetooth::presence_detail_fresh(dev, cfg.bt_scan_timeout_mult) {
+            Ok(d) if d.confirmed => Some(d.online),
+            _ => None,
+        }
+    } else {
+        let ip = cfg.monitor_ip.trim();
+        if ip.is_empty() {
+            return None;
+        }
+        // 执行前复核用两次 Ping：任一次有响应就算在线，
+        // 避免手机 WiFi 省电导致的单包丢失让离线任务照常执行
+        if netcheck::ping_once(ip, cfg.ping_timeout_ms) {
+            return Some(true);
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        Some(netcheck::ping_once(ip, cfg.ping_timeout_ms))
+    }
+}
+
 fn fire_pending(state: &Arc<AppState>) {
     let due: Vec<PendingAction> = {
         let mut m = state.monitor.lock().unwrap();
@@ -283,12 +476,52 @@ fn fire_pending(state: &Arc<AppState>) {
         m.pending = keep;
         due
     };
+    // 同一批任务通常共享同一触发方向，只复核一次
+    let mut verdicts: HashMap<String, Option<bool>> = HashMap::new();
     for t in due {
         logger::log(
             INFO,
             CAT_MONITOR,
             &format!("联动规则「{}」到期：{}", t.note, t.action.desc()),
         );
+        let expected_online = t.trigger == TRIGGER_ONLINE;
+        let verdict = *verdicts
+            .entry(t.trigger.clone())
+            .or_insert_with(|| verify_current_state(state));
+        if let Some(actual) = verdict {
+            if actual != expected_online {
+                logger::log(
+                    WARN,
+                    CAT_MONITOR,
+                    &format!(
+                        "规则「{}」执行前复核：目标当前已{}，与触发条件（已{}）不符，取消执行",
+                        t.note,
+                        if actual { "上线" } else { "离线" },
+                        if expected_online { "上线" } else { "离线" }
+                    ),
+                );
+                continue;
+            }
+            logger::log(
+                INFO,
+                CAT_MONITOR,
+                &format!(
+                    "规则「{}」执行前复核通过：目标仍{}",
+                    t.note,
+                    if actual { "在线" } else { "离线" }
+                ),
+            );
+        } else {
+            logger::log(
+                WARN,
+                CAT_MONITOR,
+                &format!(
+                    "规则「{}」执行前复核无法确认，按已确认的{}状态继续执行",
+                    t.note,
+                    if expected_online { "在线" } else { "离线" }
+                ),
+            );
+        }
         match execute_action(state, &t.action) {
             Ok(msg) => logger::log(
                 INFO,
@@ -313,6 +546,24 @@ pub fn cancel_pending(state: &AppState, rule_id: Option<u32>) -> Vec<PendingActi
         .partition(|p| rule_id.map(|id| p.rule_id == id).unwrap_or(true));
     m.pending = keep;
     cancelled
+}
+
+/// 监控目标/方式变更后重置运行时状态：
+/// 旧目标的在线状态不能与新目标的首次检测结果比较，否则会凭空产生一次
+/// “离线→上线 / 上线→离线”并误触发联动。
+pub fn reset_monitor(state: &AppState) {
+    let mut m = state.monitor.lock().unwrap();
+    m.generation = m.generation.wrapping_add(1);
+    m.last_tick = Instant::now();
+    m.ip_online = None;
+    m.ip_last_check = None;
+    m.latency_ms = None;
+    m.last_transition = None;
+    m.pending.clear();
+    m.offline_since = None;
+    m.offline_confirm_hits = 0;
+    m.unknown_count = 0;
+    m.unknown_log_at = None;
 }
 
 /// 执行一个规则动作，返回结果描述
@@ -434,6 +685,11 @@ pub fn build_status(state: &AppState) -> Status {
     let path_exists = !cfg.program_path.trim().is_empty() && Path::new(&cfg.program_path).is_file();
     let program_running =
         path_exists && process::is_exe_running(cfg.program_path.trim_end_matches('"'));
+    let confirm_sec = cfg.offline_confirm_sec.min(600) as u64;
+    let confirm_remaining = m
+        .offline_since
+        .map(|t| confirm_sec.saturating_sub(t.elapsed().as_secs()))
+        .unwrap_or(0);
     let pendings = m
         .pending
         .iter()
@@ -454,6 +710,8 @@ pub fn build_status(state: &AppState) -> Status {
         program_path_exists: path_exists,
         linkage_enabled: cfg.linkage_enabled,
         monitor_mode: cfg.monitor_mode.clone(),
+        offline_confirming: m.offline_since.is_some(),
+        offline_confirm_remaining_sec: confirm_remaining,
         pendings,
         monitor_alive: m.last_tick.elapsed() < HEARTBEAT_TIMEOUT,
     }
@@ -642,7 +900,7 @@ mod tests {
         let state = make_state(cfg);
 
         // 上线 → 调度规则1（关闭监控程序）
-        on_transition(&state, &state.config_snapshot(), true, "IP 192.0.2.1");
+        on_transition(&state, &state.config_snapshot(), true, "IP 192.0.2.1", "");
         {
             let m = state.monitor.lock().unwrap();
             assert_eq!(m.pending.len(), 1, "上线应调度 1 条规则");
@@ -651,7 +909,7 @@ mod tests {
         }
 
         // 离线 → 规则1作废，调度规则2（启动监控程序）
-        on_transition(&state, &state.config_snapshot(), false, "IP 192.0.2.1");
+        on_transition(&state, &state.config_snapshot(), false, "IP 192.0.2.1", "");
         {
             let m = state.monitor.lock().unwrap();
             assert_eq!(m.pending.len(), 1, "反转后应只剩离线规则");
@@ -664,7 +922,7 @@ mod tests {
         assert!(state.monitor.lock().unwrap().pending.is_empty());
 
         // 按规则 ID 取消
-        on_transition(&state, &state.config_snapshot(), true, "IP 192.0.2.1");
+        on_transition(&state, &state.config_snapshot(), true, "IP 192.0.2.1", "");
         let cancelled = cancel_pending(&state, Some(1));
         assert_eq!(cancelled.len(), 1);
         assert!(state.monitor.lock().unwrap().pending.is_empty());
@@ -675,7 +933,7 @@ mod tests {
             rules: Config::default_rules(),
             ..Config::default()
         };
-        on_transition(&state, &cfg_off, true, "IP 192.0.2.1");
+        on_transition(&state, &cfg_off, true, "IP 192.0.2.1", "");
         assert!(state.monitor.lock().unwrap().pending.is_empty());
     }
 
@@ -697,9 +955,84 @@ mod tests {
             ..Config::default()
         };
         let state = make_state(cfg);
-        on_transition(&state, &state.config_snapshot(), true, "IP 192.0.2.1");
+        on_transition(&state, &state.config_snapshot(), true, "IP 192.0.2.1", "");
         let m = state.monitor.lock().unwrap();
         assert_eq!(m.pending.len(), 2, "上线应同时调度规则 1 和 3");
+    }
+
+    /// 单次不可达只进入“离线确认”，不能立刻判离线/排任务
+    #[test]
+    fn short_blip_is_filtered() {
+        let cfg = Config {
+            linkage_enabled: true,
+            offline_confirm_sec: 30,
+            rules: Config::default_rules(),
+            ..Config::default()
+        };
+        let state = make_state(cfg.clone());
+        let gen = state.monitor.lock().unwrap().generation;
+        state.monitor.lock().unwrap().ip_online = Some(true);
+
+        handle_presence(&state, false, true, gen, 10, "IP 192.0.2.1", "Ping 超时");
+        {
+            let m = state.monitor.lock().unwrap();
+            assert_eq!(m.ip_online, Some(true), "确认期内仍应显示在线");
+            assert!(m.offline_since.is_some(), "应进入离线确认");
+            assert!(m.pending.is_empty(), "确认期内不能排任何联动任务");
+        }
+
+        // 确认期内恢复可达 → 取消确认，不产生任何状态变化
+        handle_presence(&state, true, true, gen, 10, "IP 192.0.2.1", "Ping 有响应");
+        let m = state.monitor.lock().unwrap();
+        assert_eq!(m.ip_online, Some(true));
+        assert!(m.offline_since.is_none());
+        assert!(m.pending.is_empty());
+    }
+
+    /// 连续不可达超过确认窗口且至少两次明确失败 → 判离线并排期
+    #[test]
+    fn confirmed_offline_after_window() {
+        let cfg = Config {
+            linkage_enabled: true,
+            offline_confirm_sec: 5,
+            rules: Config::default_rules(),
+            ..Config::default()
+        };
+        let state = make_state(cfg.clone());
+        let gen = state.monitor.lock().unwrap().generation;
+        {
+            let mut m = state.monitor.lock().unwrap();
+            m.ip_online = Some(true);
+            m.offline_since = Some(Instant::now() - Duration::from_secs(10));
+            m.offline_confirm_hits = 1;
+        }
+
+        handle_presence(&state, false, true, gen, 10, "IP 192.0.2.1", "Ping 超时");
+        let m = state.monitor.lock().unwrap();
+        assert_eq!(m.ip_online, Some(false));
+        assert!(m.offline_since.is_none());
+        assert_eq!(m.pending.len(), 1, "离线规则应已排期");
+        assert_eq!(m.pending[0].trigger, TRIGGER_OFFLINE);
+    }
+
+    /// 目标/方式变更必须丢弃旧状态与旧任务
+    #[test]
+    fn target_change_resets_runtime_state() {
+        let cfg = Config {
+            linkage_enabled: true,
+            rules: Config::default_rules(),
+            ..Config::default()
+        };
+        let state = make_state(cfg);
+        on_transition(&state, &state.config_snapshot(), false, "IP 192.0.2.1", "");
+        let gen = state.monitor.lock().unwrap().generation;
+
+        reset_monitor(&state);
+        let m = state.monitor.lock().unwrap();
+        assert!(m.generation > gen);
+        assert_eq!(m.ip_online, None);
+        assert!(m.pending.is_empty());
+        assert!(m.offline_since.is_none());
     }
 
     /// 自定义脚本执行（隐藏方式运行 cmd 脚本写文件）

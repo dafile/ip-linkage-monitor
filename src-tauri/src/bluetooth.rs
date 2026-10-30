@@ -16,6 +16,7 @@
 
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use serde::Serialize;
 use winapi::shared::minwindef::DWORD;
@@ -228,13 +229,6 @@ pub fn classic_cache() -> Vec<BtDevice> {
     }
 }
 
-/// 目标设备是否有经典蓝牙档案处于连接状态（音频/网络共享等）
-pub fn classic_connected(matcher: &str) -> bool {
-    classic_cache()
-        .iter()
-        .any(|d| d.connected && device_matches(&d.name, &d.address, matcher))
-}
-
 /* ===================== 通道①：系统维持连接（已配对 BLE 设备） ===================== */
 
 /// 已建立的系统维持连接（session/订阅对象必须存活，维持才持续生效）
@@ -355,10 +349,18 @@ pub fn link_connected(link: &BtLink) -> Result<bool, String> {
 
 /// 目标是否存在已配对设备（用于提示检测模式）
 pub fn paired_match_exists(matcher: &str) -> Result<bool, String> {
-    for (name, addr, _id) in paired_ble_devices()? {
-        if device_matches(&name, &addr, matcher) {
-            return Ok(true);
+    if let Ok(pairs) = paired_ble_devices() {
+        for (name, addr, _id) in pairs {
+            if device_matches(&name, &addr, matcher) {
+                return Ok(true);
+            }
         }
+    }
+    if classic_cache()
+        .iter()
+        .any(|d| d.paired && device_matches(&d.name, &d.address, matcher))
+    {
+        return Ok(true);
     }
     Ok(false)
 }
@@ -411,45 +413,123 @@ pub fn scan_all(timeout_mult: u32) -> Result<Vec<BtDevice>, String> {
 
 /* ===================== 通道②：定向探测（寻呼，对所有开着蓝牙的手机有效） ===================== */
 
-static PROBE: OnceLock<Mutex<Option<(std::time::Instant, bool)>>> = OnceLock::new();
-/// 探测结果缓存时长（避免频繁寻呼手机，也保证离线判定在 ~10 秒内生效）
-const PROBE_TTL: Duration = Duration::from_secs(10);
+#[derive(Default)]
+struct ProbeCache {
+    addr: String,
+    at: Option<std::time::Instant>,
+    result: Option<bool>,
+    last_attempt: Option<std::time::Instant>,
+}
+
+static PROBE: OnceLock<Mutex<ProbeCache>> = OnceLock::new();
+/// 同一时刻只允许一个真实寻呼，避免超时后线程堆积、蓝牙电台被反复争抢
+static PROBE_BUSY: AtomicBool = AtomicBool::new(false);
+/// 正向结果缓存：减少对手机的频繁寻呼（10 秒内复用，离开后也能较快开始确认）
+const PROBE_POS_TTL: Duration = Duration::from_secs(10);
+/// 负向结果缓存：必须很短。以前缓存 10 秒，导致单次探测失败会被放大成
+/// 10~13 秒的假离线（日志中 155 次 10~30 秒离线就是这么来的）。
+const PROBE_NEG_TTL: Duration = Duration::from_millis(1500);
+/// 两次实际探测的最小间隔，避免探测线程堆积/蓝牙电台争抢
+const PROBE_MIN_GAP: Duration = Duration::from_millis(1200);
 /// 单次探测的看门狗（设备不可达时系统调用可能长时间阻塞）
-const PROBE_WATCHDOG: Duration = Duration::from_secs(15);
+const PROBE_WATCHDOG: Duration = Duration::from_secs(6);
+/// 失败重试：同一地址最多做 2 次真实寻呼；两次都返回明确的“不可达”才判离线
+const PROBE_ATTEMPTS: u32 = 2;
+const PROBE_RETRY_GAP: Duration = Duration::from_millis(350);
 
 /// 定向服务发现（RFCOMM/SDP）＝对已知 MAC 寻呼：手机开着蓝牙且在范围内
 /// 一定会响应配对设备的寻呼（与"可被发现"无关）。
-/// 可达 → Some(true)；不可达 → Some(false)；API 异常 → None。
-pub fn rfcomm_probe(addr_hex: &str) -> Option<bool> {
+///
+/// 返回三态：`Some(true)` 可达；`Some(false)` 明确不可达；`None` 无法确认
+/// （超时/API 异常，调用方必须保持原状态，不能当成离线）。
+/// `force = true` 时绕过缓存，用于联动任务执行前的复核。
+pub fn rfcomm_probe(addr_hex: &str, force: bool) -> Option<bool> {
+    let addr = addr_hex.trim().to_lowercase();
+    if addr.len() != 12 || !addr.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let cache = PROBE.get_or_init(|| Mutex::new(ProbeCache::default()));
     {
-        let lock = PROBE.get_or_init(|| Mutex::new(None)).lock().unwrap();
-        if let Some((t, v)) = lock.as_ref() {
-            if t.elapsed() < PROBE_TTL {
-                return Some(*v);
+        let mut c = cache.lock().unwrap();
+        if !force && c.addr == addr {
+            if let (Some(at), Some(v)) = (c.at, c.result) {
+                let ttl = if v { PROBE_POS_TTL } else { PROBE_NEG_TTL };
+                if at.elapsed() < ttl {
+                    return Some(v);
+                }
             }
         }
+        // 无论是否 force，都避免在极短时间内重复发起真实寻呼
+        if let Some(t) = c.last_attempt {
+            if t.elapsed() < PROBE_MIN_GAP {
+                return if c.addr == addr { c.result } else { None };
+            }
+        }
+        c.last_attempt = Some(std::time::Instant::now());
     }
-    let r = probe_once(addr_hex)?;
-    let mut lock = PROBE.get_or_init(|| Mutex::new(None)).lock().unwrap();
-    *lock = Some((std::time::Instant::now(), r));
-    Some(r)
+    let r = probe_with_retries(&addr);
+    let mut c = cache.lock().unwrap();
+    c.addr = addr;
+    c.at = Some(std::time::Instant::now());
+    c.result = r;
+    r
+}
+
+fn probe_with_retries(addr: &str) -> Option<bool> {
+    let mut false_count = 0u32;
+    for attempt in 0..PROBE_ATTEMPTS {
+        match probe_once(addr) {
+            Some(true) => return Some(true),
+            Some(false) => {
+                false_count += 1;
+                if false_count >= 2 {
+                    return Some(false);
+                }
+            }
+            // 超时/API 异常：不重试（旧线程可能仍占用电台），直接返回“无法确认”
+            None => return None,
+        }
+        if attempt + 1 < PROBE_ATTEMPTS {
+            std::thread::sleep(PROBE_RETRY_GAP);
+        }
+    }
+    if false_count >= 2 {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 fn probe_once(addr_hex: &str) -> Option<bool> {
+    if PROBE_BUSY.swap(true, Ordering::SeqCst) {
+        return None; // 上一次寻呼仍未结束
+    }
     let (tx, rx) = std::sync::mpsc::channel();
     let addr_str = addr_hex.trim().to_string();
     std::thread::spawn(move || {
+        struct BusyGuard;
+        impl Drop for BusyGuard {
+            fn drop(&mut self) {
+                PROBE_BUSY.store(false, Ordering::SeqCst);
+            }
+        }
+        let _guard = BusyGuard;
         let r = (|| -> Option<bool> {
             let addr = u64::from_str_radix(&addr_str, 16).ok()?;
-            let dev = BluetoothDevice::FromBluetoothAddressAsync(addr).ok()?.get().ok()?;
+            let dev = BluetoothDevice::FromBluetoothAddressAsync(addr)
+                .ok()?
+                .get()
+                .ok()?;
             let result: RfcommDeviceServicesResult = dev
                 .GetRfcommServicesWithCacheModeAsync(BluetoothCacheMode::Uncached)
                 .ok()?
                 .get()
                 .ok()?;
             let err = result.Error().ok()?;
-            let services = result.Services().ok()?.Size().ok()?;
-            Some(err == BluetoothError::Success && services > 0)
+            // 关键修复：Uncached 的 SDP 事务返回 Success，就证明手机响应了寻呼。
+            // 某些 Android 设备的 SDP 服务列表可能为空（services == 0），
+            // 旧代码把这种情况误判成离线。
+            Some(err == BluetoothError::Success)
         })();
         let _ = tx.send(r);
     });
@@ -463,6 +543,8 @@ fn probe_once(addr_hex: &str) -> Option<bool> {
 #[serde(rename_all = "camelCase")]
 pub struct PresenceDetail {
     pub online: bool,
+    /// 结论是否可信：false = 探测过程异常/无法确认，调用方应保持原状态
+    pub confirmed: bool,
     /// 系统维持连接是否已连上（BLE）
     pub ble_connected: bool,
     /// 是否有经典蓝牙档案在连接
@@ -475,58 +557,163 @@ pub struct PresenceDetail {
     pub mode: String,
 }
 
-/// 判断目标设备是否真实在附近（多通道汇总，带详细结果）。
-/// 已配对：系统 BLE 连接 ∨ 经典档案连接 ∨ 定向探测可达；未配对：inquiry 真实听到。
-pub fn presence_detail(matcher: &str, timeout_mult: u32) -> Result<PresenceDetail, String> {
+impl PresenceDetail {
+    /// 面向日志/界面的单行诊断摘要
+    pub fn summary(&self) -> String {
+        let mut parts = vec![format!(
+            "BLE维持连接：{}",
+            if self.ble_connected { "已连接" } else { "未连接" }
+        )];
+        parts.push(format!(
+            "经典档案连接：{}",
+            if self.classic_connected { "在连接" } else { "无" }
+        ));
+        if let Some(p) = self.probe {
+            parts.push(format!("定向探测：{}", if p { "可达" } else { "不可达" }));
+        }
+        if let Some(s) = self.scanned {
+            parts.push(format!(
+                "主动扫描：{}",
+                if s { "发现目标" } else { "未发现目标" }
+            ));
+        }
+        parts.push(format!(
+            "结论：{}",
+            if !self.confirmed {
+                "无法确认"
+            } else if self.online {
+                "在线"
+            } else {
+                "离线"
+            }
+        ));
+        parts.join("；")
+    }
+}
+
+fn ensure_radio() -> Result<(), String> {
+    unsafe {
+        let h = open_radio()?;
+        CloseHandle(h);
+    }
+    Ok(())
+}
+
+/// 选出用于定向寻呼的经典蓝牙地址。
+///
+/// BLE 地址不一定是经典蓝牙地址（部分手机的 BLE 地址是随机地址，和经典 MAC
+/// 不同），只拿 BLE 地址去寻呼会得到假离线。优先使用用户填写的 MAC，
+/// 其次是经典配对缓存里的地址，最后才是 BLE 地址。只选一个最佳地址，
+/// 避免对错误地址寻呼失败而干扰判断。
+fn best_probe_address(matcher: &str, link_addr: &str, classic: &[BtDevice]) -> Option<String> {
+    if let Some(mac) = normalize_mac(matcher.trim()) {
+        return Some(mac);
+    }
+    if let Some(d) = classic
+        .iter()
+        .find(|d| d.paired && device_matches(&d.name, &d.address, matcher) && !d.address.is_empty())
+    {
+        return Some(d.address.clone());
+    }
+    if !link_addr.is_empty() {
+        return Some(link_addr.to_string());
+    }
+    classic
+        .iter()
+        .find(|d| device_matches(&d.name, &d.address, matcher) && !d.address.is_empty())
+        .map(|d| d.address.clone())
+}
+
+fn presence_detail_inner(
+    matcher: &str,
+    timeout_mult: u32,
+    force_probe: bool,
+) -> Result<PresenceDetail, String> {
     let key = matcher.trim().to_string();
     if key.is_empty() {
         return Err("未指定要监控的蓝牙设备（名称或 MAC）".into());
     }
+    // 没有蓝牙适配器时直接报错（调用方保持原状态），不要伪装成“离线”
+    ensure_radio()?;
+
     let lock = LINK.get_or_init(|| Mutex::new(None));
     let mut guard = lock.lock().unwrap();
     let need_new = match guard.as_ref() {
         Some((k, _)) => *k != key,
         None => true,
     };
+    let mut link_err: Option<String> = None;
     if need_new {
         *guard = None; // 释放旧目标连接（对象丢弃即断开维持）
-        if let Some(link) = prepare_link(matcher)? {
-            // 给系统时间建立/恢复连接：手机在范围内会自动连上
-            let deadline = std::time::Instant::now() + Duration::from_millis(LINK_WAIT_MS);
-            while std::time::Instant::now() < deadline {
-                if link_connected(&link).unwrap_or(false) {
-                    break;
+        match prepare_link(matcher) {
+            Ok(Some(link)) => {
+                // 给系统时间建立/恢复连接：手机在范围内会自动连上
+                let deadline = std::time::Instant::now() + Duration::from_millis(LINK_WAIT_MS);
+                while std::time::Instant::now() < deadline {
+                    if link_connected(&link).unwrap_or(false) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(400));
                 }
-                std::thread::sleep(Duration::from_millis(400));
+                *guard = Some((key, link));
             }
-            *guard = Some((key, link));
+            Ok(None) => {}
+            Err(e) => link_err = Some(e),
         }
     }
-    if let Some((_, link)) = guard.as_ref() {
-        let ble_connected = link_connected(link)?;
-        let classic = classic_connected(matcher);
-        let mut probe = None;
-        let online = if ble_connected || classic {
-            true
-        } else {
-            // 手机的 BLE 空闲时不广播，系统主动连不上；改用定向寻呼探测
-            let addr = if link.address.is_empty() {
-                normalize_mac(matcher).unwrap_or_default()
-            } else {
-                link.address.clone()
-            };
-            probe = if addr.is_empty() { None } else { rfcomm_probe(&addr) };
-            probe.unwrap_or(false)
-        };
+
+    let classic = classic_cache();
+    let classic_conn = classic
+        .iter()
+        .any(|d| d.connected && device_matches(&d.name, &d.address, matcher));
+    let paired_classic = classic
+        .iter()
+        .find(|d| d.paired && device_matches(&d.name, &d.address, matcher));
+    let link_addr = guard
+        .as_ref()
+        .map(|(_, link)| link.address.clone())
+        .unwrap_or_default();
+    let ble_connected = match guard.as_ref() {
+        Some((_, link)) => link_connected(link).unwrap_or(false),
+        None => false,
+    };
+
+    if guard.is_some() || paired_classic.is_some() {
+        if ble_connected || classic_conn {
+            return Ok(PresenceDetail {
+                online: true,
+                confirmed: true,
+                ble_connected,
+                classic_connected: classic_conn,
+                probe: None,
+                scanned: None,
+                mode: "paired".into(),
+            });
+        }
+
+        // 手机的 BLE 空闲时不广播，系统主动连不上；改用定向寻呼探测。
+        // 注意：不缓存负结果、失败要重试、Success 即视为可达（见 rfcomm_probe）。
+        let probe = best_probe_address(matcher, &link_addr, &classic)
+            .and_then(|addr| rfcomm_probe(&addr, force_probe));
+        let online = probe == Some(true);
+        let confirmed = probe.is_some();
+        if !confirmed {
+            if let Some(e) = link_err {
+                // BLE 连接建立失败且没有任何探测结论：按“检测异常”上报
+                return Err(e);
+            }
+        }
         return Ok(PresenceDetail {
             online,
+            confirmed,
             ble_connected,
-            classic_connected: classic,
+            classic_connected: classic_conn,
             probe,
             scanned: None,
             mode: "paired".into(),
         });
     }
+
     drop(guard);
     // 未配对 → 兜底：经典 inquiry（仅「可被发现」设备可见）
     let scanned = inquiry(timeout_mult)?
@@ -534,6 +721,7 @@ pub fn presence_detail(matcher: &str, timeout_mult: u32) -> Result<PresenceDetai
         .any(|d| d.in_range && device_matches(&d.name, &d.address, matcher));
     Ok(PresenceDetail {
         online: scanned,
+        confirmed: true,
         ble_connected: false,
         classic_connected: false,
         probe: None,
@@ -542,9 +730,16 @@ pub fn presence_detail(matcher: &str, timeout_mult: u32) -> Result<PresenceDetai
     })
 }
 
-/// 判断目标设备是否真实在附近（在线即 true）
-pub fn presence(matcher: &str, timeout_mult: u32) -> Result<bool, String> {
-    Ok(presence_detail(matcher, timeout_mult)?.online)
+/// 判断目标设备是否真实在附近（多通道汇总，带详细结果）。
+/// 已配对：系统 BLE 连接 ∨ 经典档案连接 ∨ 定向探测可达；未配对：inquiry 真实听到。
+pub fn presence_detail(matcher: &str, timeout_mult: u32) -> Result<PresenceDetail, String> {
+    presence_detail_inner(matcher, timeout_mult, false)
+}
+
+/// 同 `presence_detail`，但强制发起一次新的定向寻呼（绕过结果缓存），
+/// 用于联动任务执行前的最后复核。
+pub fn presence_detail_fresh(matcher: &str, timeout_mult: u32) -> Result<PresenceDetail, String> {
+    presence_detail_inner(matcher, timeout_mult, true)
 }
 
 /// 当前系统维持连接绑定的目标（名称, MAC）；未绑定时返回 None
@@ -602,6 +797,41 @@ mod tests {
     fn mac_colon_format() {
         assert_eq!(mac_colon("a4ccb388f111"), "a4:cc:b3:88:f1:11");
         assert_eq!(mac_colon(""), "");
+    }
+
+    #[test]
+    fn probe_address_priority() {
+        let devs = vec![
+            BtDevice {
+                name: "k6u".into(),
+                address: "a4ccb388f111".into(),
+                connected: false,
+                in_range: false,
+                paired: true,
+            },
+            BtDevice {
+                name: "other".into(),
+                address: "112233445566".into(),
+                connected: false,
+                in_range: false,
+                paired: true,
+            },
+        ];
+        // 名称 → 优先经典配对缓存里的 MAC（不是 BLE 随机地址）
+        assert_eq!(
+            best_probe_address("k6u", "deadbeefcafe", &devs).as_deref(),
+            Some("a4ccb388f111")
+        );
+        // 明确填写 MAC → 直接使用
+        assert_eq!(
+            best_probe_address("A4:CC:B3:88:F1:11", "deadbeefcafe", &devs).as_deref(),
+            Some("a4ccb388f111")
+        );
+        // 名称不在经典缓存 → 退回 BLE 地址
+        assert_eq!(
+            best_probe_address("unknown", "deadbeefcafe", &devs).as_deref(),
+            Some("deadbeefcafe")
+        );
     }
 
     #[test]
