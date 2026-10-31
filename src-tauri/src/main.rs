@@ -65,6 +65,16 @@ fn resolve_data_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 
 fn main() {
     tauri::Builder::default()
+        // 单实例守卫：必须在其他插件之前注册。
+        // 第二个进程会立即退出，并在此回调中通知已运行的实例把窗口带到前台。
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            logger::log(
+                logger::INFO,
+                logger::CAT_SYSTEM,
+                "检测到重复启动：已聚焦正在运行的窗口",
+            );
+            tray::show_main(app);
+        }))
         .setup(|app| {
             let handle = app.handle().clone();
             let data_dir = resolve_data_dir(&handle)?;

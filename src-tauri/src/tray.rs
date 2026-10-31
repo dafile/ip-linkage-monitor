@@ -96,10 +96,15 @@ pub fn create(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn show_main(app: &AppHandle) {
+/// 显示并聚焦主窗口（托盘点击、重复启动时复用）
+pub(crate) fn show_main(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
         let _ = w.unminimize();
         let _ = w.set_focus();
+        // Windows 偶发拒绝前台聚焦时，闪动任务栏提示用户
+        if !w.is_focused().unwrap_or(false) {
+            let _ = w.request_user_attention(Some(tauri::UserAttentionType::Informational));
+        }
     }
 }
