@@ -156,11 +156,11 @@ pub fn spawn_thread(_app: AppHandle, state: Arc<AppState>) {
         let mut scan_errors: u32 = 0;
         let mut local_epoch = state.service_epoch.load(Ordering::Relaxed);
         loop {
-            // 软重启请求：重置检测状态与蓝牙会话（不退出进程、不重建窗口）
-            let epoch = state.service_epoch.load(Ordering::Relaxed);
-            if epoch != local_epoch {
-                local_epoch = epoch;
-                apply_soft_reset(&state);
+            // 服务代号：软重启已在请求时同步重置状态，这里只重置本地错误计数；
+            // 检测函数会带代号守卫，丢弃重置前发出的在途结果
+            let loop_epoch = state.service_epoch.load(Ordering::Relaxed);
+            if loop_epoch != local_epoch {
+                local_epoch = loop_epoch;
                 scan_errors = 0;
             }
             let cfg = state.config_snapshot();
@@ -239,6 +239,7 @@ pub fn spawn_thread(_app: AppHandle, state: Arc<AppState>) {
                             d.online,
                             d.confirmed,
                             generation,
+                            loop_epoch,
                             latency,
                             &subject,
                             &d.detail,
@@ -258,6 +259,7 @@ fn handle_presence(
     online: bool,
     confirmed: bool,
     generation: u64,
+    epoch: u64,
     latency_ms: u64,
     subject: &str,
     detail: &str,
@@ -272,8 +274,8 @@ fn handle_presence(
     let mut unknown_to_log: Option<(u32, bool)> = None;
     {
         let mut m = state.monitor.lock().unwrap();
-        if m.generation != generation {
-            return; // 检测期间目标/模式已变更，丢弃旧结果
+        if m.generation != generation || state.service_epoch.load(Ordering::SeqCst) != epoch {
+            return; // 检测期间目标/模式已变更或发生软重启：丢弃旧结果
         }
         m.last_tick = Instant::now();
         m.ip_last_check = Some(now_ts());
@@ -957,6 +959,55 @@ mod tests {
         assert!(m.pending.is_empty(), "待执行任务应清空");
     }
 
+    /// 软重启请求应同步清空状态（不等待监控线程下一轮），避免界面残留旧状态
+    #[test]
+    fn soft_restart_applies_synchronously() {
+        let state = make_state(Config::default());
+        {
+            let mut m = state.monitor.lock().unwrap();
+            m.ip_online = Some(true);
+            m.latency_ms = Some(5);
+            m.pending.push(PendingAction {
+                rule_id: 1,
+                note: "t".into(),
+                action: RuleAction::simple(ACT_START),
+                trigger: TRIGGER_OFFLINE.into(),
+                fire_at: Instant::now() + Duration::from_secs(30),
+                due_ts: "00:00:00".into(),
+            });
+        }
+        let before = state.service_epoch.load(Ordering::SeqCst);
+        let after = crate::restart::request_soft_restart(&state);
+        assert_eq!(after, before + 1, "代号应递增");
+        let m = state.monitor.lock().unwrap();
+        assert!(m.ip_online.is_none(), "请求返回时应已重置在线状态");
+        assert!(m.latency_ms.is_none());
+        assert!(m.pending.is_empty());
+    }
+
+    /// 重置前发出、重置后返回的旧检测结果必须被丢弃（代号守卫）
+    #[test]
+    fn stale_detection_result_ignored_after_restart() {
+        let state = make_state(Config::default());
+        let gen = state.monitor.lock().unwrap().generation;
+        let old_epoch = state.service_epoch.load(Ordering::SeqCst);
+        crate::restart::request_soft_restart(&state);
+        handle_presence(
+            &state, false, true, gen, old_epoch, 10, "IP 192.0.2.1", "Ping 超时",
+        );
+        assert!(
+            state.monitor.lock().unwrap().ip_online.is_none(),
+            "旧代次结果应被丢弃"
+        );
+        let epoch = state.service_epoch.load(Ordering::SeqCst);
+        handle_presence(&state, false, true, gen, epoch, 10, "IP 192.0.2.1", "Ping 超时");
+        assert_eq!(
+            state.monitor.lock().unwrap().ip_online,
+            Some(false),
+            "新代次结果应正常生效"
+        );
+    }
+
     /// 规则调度：方向、反转作废、取消、总开关
     #[test]
     fn rule_schedule_and_cancel() {
@@ -1041,7 +1092,7 @@ mod tests {
         let gen = state.monitor.lock().unwrap().generation;
         state.monitor.lock().unwrap().ip_online = Some(true);
 
-        handle_presence(&state, false, true, gen, 10, "IP 192.0.2.1", "Ping 超时");
+        handle_presence(&state, false, true, gen, state.service_epoch.load(Ordering::SeqCst), 10, "IP 192.0.2.1", "Ping 超时");
         {
             let m = state.monitor.lock().unwrap();
             assert_eq!(m.ip_online, Some(true), "确认期内仍应显示在线");
@@ -1050,7 +1101,7 @@ mod tests {
         }
 
         // 确认期内恢复可达 → 取消确认，不产生任何状态变化
-        handle_presence(&state, true, true, gen, 10, "IP 192.0.2.1", "Ping 有响应");
+        handle_presence(&state, true, true, gen, state.service_epoch.load(Ordering::SeqCst), 10, "IP 192.0.2.1", "Ping 有响应");
         let m = state.monitor.lock().unwrap();
         assert_eq!(m.ip_online, Some(true));
         assert!(m.offline_since.is_none());
@@ -1075,7 +1126,7 @@ mod tests {
             m.offline_confirm_hits = 1;
         }
 
-        handle_presence(&state, false, true, gen, 10, "IP 192.0.2.1", "Ping 超时");
+        handle_presence(&state, false, true, gen, state.service_epoch.load(Ordering::SeqCst), 10, "IP 192.0.2.1", "Ping 超时");
         let m = state.monitor.lock().unwrap();
         assert_eq!(m.ip_online, Some(false));
         assert!(m.offline_since.is_none());

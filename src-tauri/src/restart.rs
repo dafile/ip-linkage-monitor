@@ -183,10 +183,13 @@ pub fn spawn_thread(_app: AppHandle, state: Arc<AppState>) {
     });
 }
 
-/// 请求软重启：递增服务代号，监控线程会在下一轮检测前执行重置。
+/// 请求软重启：递增服务代号并**立即**重置监控状态（同步生效，避免界面残留旧状态）。
+/// 监控线程会用代号守卫丢弃重置前发出的在途检测结果。
 /// 不退出进程、不重建窗口，也不影响电脑与采集端。返回新代号。
 pub fn request_soft_restart(state: &AppState) -> u64 {
-    state.service_epoch.fetch_add(1, Ordering::SeqCst) + 1
+    let epoch = state.service_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+    crate::monitor::apply_soft_reset(state);
+    epoch
 }
 
 #[cfg(test)]

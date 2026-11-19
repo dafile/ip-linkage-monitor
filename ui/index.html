@@ -333,7 +333,7 @@
     <div class="logo"></div>
     <div>
       <h1>掌上看家联动 IP 在线状态监控</h1>
-      <div class="sub">IP Linkage Monitor v1.6.3</div>
+      <div class="sub">IP Linkage Monitor v1.6.4</div>
     </div>
     <div class="spacer"></div>
     <div class="top-pills">
@@ -1269,8 +1269,19 @@ $("btnRestartNow").addEventListener("click", async () => {
   if (!ok) return;
   try {
     await invoke("restart_now");
+    // 后端已同步重置状态：立即清掉旧显示，避免残留“在线”
+    $("ipRing").className = "ring";
+    const w = $("ipStateWord");
+    w.className = "state-word";
+    w.textContent = "检测中…";
+    $("ipLatency").textContent = "-";
+    $("ipLastChange").textContent = "—";
+    $("pillIp").className = "pill";
+    $("pillIpText").textContent = "检测中…";
     toast("监控服务已重启（窗口保持打开）", "success", 4000);
+    refreshStatus();
     setTimeout(refreshStatus, 1500);
+    setTimeout(refreshStatus, 4000);
   } catch (e) {
     toast("重启失败：" + e, "error", 6000);
   }
