@@ -49,6 +49,16 @@ fn validate_and_normalize(cfg: &mut Config) -> Result<(), String> {
     cfg.poll_interval_sec = cfg.poll_interval_sec.clamp(1, 60);
     cfg.ping_timeout_ms = cfg.ping_timeout_ms.clamp(200, 10000);
     cfg.offline_confirm_sec = cfg.offline_confirm_sec.min(600);
+    if cfg.auto_restart_mode != "daily" {
+        cfg.auto_restart_mode = "interval".to_string();
+    }
+    cfg.auto_restart_interval_min = cfg.auto_restart_interval_min.clamp(5, 1440);
+    let daily_time = cfg.auto_restart_daily_time.trim().to_string();
+    cfg.auto_restart_daily_time = if chrono::NaiveTime::parse_from_str(&daily_time, "%H:%M").is_ok() {
+        daily_time
+    } else {
+        "04:00".to_string()
+    };
     if cfg.monitor_mode != "bluetooth" {
         cfg.monitor_mode = "ip".to_string();
     }
@@ -172,6 +182,32 @@ pub fn set_config(
                     fmt_sec(new_cfg.offline_confirm_sec)
                 }
             ));
+        }
+        if old.auto_restart_enabled != new_cfg.auto_restart_enabled {
+            changes.push(format!(
+                "定时重启服务 {} → {}",
+                if old.auto_restart_enabled { "开" } else { "关" },
+                if new_cfg.auto_restart_enabled { "开" } else { "关" }
+            ));
+        }
+        if old.auto_restart_mode != new_cfg.auto_restart_mode {
+            changes.push(format!(
+                "定时重启方式 → {}",
+                if new_cfg.auto_restart_mode == "daily" {
+                    "每天定时"
+                } else {
+                    "按运行间隔"
+                }
+            ));
+        }
+        if old.auto_restart_interval_min != new_cfg.auto_restart_interval_min {
+            changes.push(format!(
+                "重启间隔 → {}",
+                crate::restart::human_interval(new_cfg.auto_restart_interval_min)
+            ));
+        }
+        if old.auto_restart_daily_time != new_cfg.auto_restart_daily_time {
+            changes.push(format!("每日重启时间 → {}", new_cfg.auto_restart_daily_time));
         }
         if old.rules != new_cfg.rules {
             let total = new_cfg.rules.len();

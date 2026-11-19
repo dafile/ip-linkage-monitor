@@ -333,7 +333,7 @@
     <div class="logo"></div>
     <div>
       <h1>掌上看家联动 IP 在线状态监控</h1>
-      <div class="sub">IP Linkage Monitor v1.5.1</div>
+      <div class="sub">IP Linkage Monitor v1.6.0</div>
     </div>
     <div class="spacer"></div>
     <div class="top-pills">
@@ -625,6 +625,48 @@
       </div>
 
       <div class="card">
+        <h3><span class="icon">🔄</span>定时重启服务 <span class="hint">长期运行后蓝牙/系统状态可能缓存陈旧，定期重启本程序可恢复灵敏</span></h3>
+        <div class="switch-row">
+          <label class="switch">
+            <input type="checkbox" id="chkRestart" />
+            <span class="track"></span><span class="thumb"></span>
+          </label>
+          <div class="desc">启用定时重启：<b>只重启本监控程序</b>，不会重启电脑、不影响采集端</div>
+        </div>
+        <div class="form-row" style="margin-top:14px">
+          <label>重启方式</label>
+          <div class="control">
+            <select id="selRestartMode">
+              <option value="interval">按运行间隔</option>
+              <option value="daily">每天定时</option>
+            </select>
+          </div>
+        </div>
+        <div class="form-row" id="restartIntervalRow">
+          <label>运行间隔</label>
+          <div class="control">
+            <select id="selRestartInterval">
+              <option value="30">30 分钟</option>
+              <option value="60">1 小时</option>
+              <option value="180">3 小时</option>
+              <option value="360">6 小时</option>
+              <option value="720">12 小时</option>
+            </select>
+          </div>
+        </div>
+        <div class="form-row" id="restartDailyRow" style="display:none">
+          <label>每天重启时间</label>
+          <div class="control">
+            <input type="time" id="inpRestartTime" />
+          </div>
+        </div>
+        <div class="form-note" id="restartHint" style="margin-left:140px"></div>
+        <div class="form-note" style="margin-left:140px; margin-top:6px">
+          重启时程序会先退出、约 1~2 秒后自动重新启动（单实例锁由新进程接管）；重启瞬间检测暂停，不会误触发联动规则。
+        </div>
+      </div>
+
+      <div class="card">
         <h3><span class="icon">🪟</span>窗口显示</h3>
         <div class="switch-row">
           <label class="switch">
@@ -808,8 +850,30 @@ function renderSettings() {
   confirmSel.value = confirmVal;
   $("chkHidden").checked = !!cfg.launch_hidden;
   $("chkTray").checked = cfg.close_to_tray !== false;
+  $("chkRestart").checked = !!cfg.auto_restart_enabled;
+  $("selRestartMode").value = cfg.auto_restart_mode === "daily" ? "daily" : "interval";
+  const rint = String(cfg.auto_restart_interval_min ?? 60);
+  const rsel = $("selRestartInterval");
+  if (!Array.from(rsel.options).some(o => o.value === rint)) {
+    const opt = document.createElement("option");
+    opt.value = rint;
+    opt.textContent = `${rint} 分钟`;
+    rsel.appendChild(opt);
+  }
+  rsel.value = rint;
+  $("inpRestartTime").value = cfg.auto_restart_daily_time || "04:00";
+  applyRestartUI();
   applyModeUI();
   renderRules();
+}
+
+function applyRestartUI() {
+  const on = !!cfg.auto_restart_enabled;
+  const daily = cfg.auto_restart_mode === "daily";
+  $("restartIntervalRow").style.display = on && !daily ? "" : "none";
+  $("restartDailyRow").style.display = on && daily ? "" : "none";
+  $("selRestartMode").disabled = !on;
+  if (!on) $("restartHint").textContent = "定时重启未启用";
 }
 
 function applyModeUI() {
@@ -1188,6 +1252,26 @@ $("selTimeout").addEventListener("change", () => { cfg.ping_timeout_ms = +$("sel
 $("selOfflineConfirm").addEventListener("change", () => { cfg.offline_confirm_sec = +$("selOfflineConfirm").value; scheduleSave(); renderStatusHints(); });
 $("chkHidden").addEventListener("change", () => { cfg.launch_hidden = $("chkHidden").checked; scheduleSave(); });
 $("chkTray").addEventListener("change", () => { cfg.close_to_tray = $("chkTray").checked; scheduleSave(); });
+$("chkRestart").addEventListener("change", () => {
+  cfg.auto_restart_enabled = $("chkRestart").checked;
+  scheduleSave();
+  applyRestartUI();
+});
+$("selRestartMode").addEventListener("change", () => {
+  cfg.auto_restart_mode = $("selRestartMode").value;
+  scheduleSave();
+  applyRestartUI();
+});
+$("selRestartInterval").addEventListener("change", () => {
+  cfg.auto_restart_interval_min = +$("selRestartInterval").value;
+  scheduleSave();
+});
+$("inpRestartTime").addEventListener("change", () => {
+  if ($("inpRestartTime").value) {
+    cfg.auto_restart_daily_time = $("inpRestartTime").value;
+    scheduleSave();
+  }
+});
 
 $("btnSaveNow").addEventListener("click", () => { dirty = true; updateSaveUI(); pump(); });
 
@@ -1424,6 +1508,13 @@ async function refreshStatus() {
     }
 
     if (cfg) $("linkageSwitch").checked = cfg.linkage_enabled;
+    if (cfg && cfg.auto_restart_enabled) {
+      $("restartHint").textContent = s.nextRestart
+        ? `下次计划重启：${s.nextRestart}（仅重启本程序，不影响电脑）`
+        : "正在计算下次重启时间…";
+    } else if (cfg) {
+      $("restartHint").textContent = "定时重启未启用";
+    }
     renderPendings(s.pendings);
   } catch (e) { /* 轮询失败静默，下次重试 */ }
 }
@@ -1538,6 +1629,8 @@ $("btnClear").addEventListener("click", async () => {
       bt_device: "", bt_scan_timeout_mult: 4, linkage_enabled: false,
       launch_hidden: true, close_to_tray: true, poll_interval_sec: 3, ping_timeout_ms: 2000,
       offline_confirm_sec: 30,
+      auto_restart_enabled: false, auto_restart_mode: "interval",
+      auto_restart_interval_min: 60, auto_restart_daily_time: "04:00",
       rules: [], rules_seeded: true,
     };
   }

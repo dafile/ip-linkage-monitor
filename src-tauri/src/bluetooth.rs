@@ -431,6 +431,26 @@ const PROBE_POS_TTL: Duration = Duration::from_secs(10);
 const PROBE_NEG_TTL: Duration = Duration::from_millis(1500);
 /// 两次实际探测的最小间隔，避免探测线程堆积/蓝牙电台争抢
 const PROBE_MIN_GAP: Duration = Duration::from_millis(1200);
+
+/// 连接状态声称「在线」时的定期复核时间。
+/// Windows 蓝牙栈长期运行后可能保留陈旧的「已连接」缓存（手机蓝牙已关仍显示在线），
+/// 因此每 RECONFIRM_SECS 用定向寻呼做一次“强证据”复核。
+const RECONFIRM_SECS: u64 = 300;
+static LAST_STRONG_CHECK: OnceLock<Mutex<Option<std::time::Instant>>> = OnceLock::new();
+
+fn reconfirm_due(last: Option<std::time::Instant>) -> bool {
+    match last {
+        None => true,
+        Some(t) => t.elapsed() >= Duration::from_secs(RECONFIRM_SECS),
+    }
+}
+
+fn mark_strong_check() {
+    *LAST_STRONG_CHECK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap() = Some(std::time::Instant::now());
+}
 /// 单次探测的看门狗（设备不可达时系统调用可能长时间阻塞）
 const PROBE_WATCHDOG: Duration = Duration::from_secs(6);
 /// 失败重试：同一地址最多做 2 次真实寻呼；两次都返回明确的“不可达”才判离线
@@ -680,12 +700,31 @@ fn presence_detail_inner(
 
     if guard.is_some() || paired_classic.is_some() {
         if ble_connected || classic_conn {
+            // 连接状态可能来自陈旧的系统缓存：定期（或调用方要求时）用定向寻呼复核。
+            // 明确不可达 → 判离线，并丢弃维持连接会话以便下次重建。
+            let last = *LAST_STRONG_CHECK
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+                .unwrap();
+            let mut probe = None;
+            if force_probe || reconfirm_due(last) {
+                if let Some(addr) = best_probe_address(matcher, &link_addr, &classic) {
+                    probe = rfcomm_probe(&addr, true);
+                    if probe.is_some() {
+                        mark_strong_check();
+                    }
+                }
+            }
+            let online = probe != Some(false);
+            if !online {
+                *guard = None;
+            }
             return Ok(PresenceDetail {
-                online: true,
+                online,
                 confirmed: true,
                 ble_connected,
                 classic_connected: classic_conn,
-                probe: None,
+                probe,
                 scanned: None,
                 mode: "paired".into(),
             });
@@ -848,6 +887,15 @@ mod tests {
         );
         let now = now_unix_ms();
         assert!(now > 1_700_000_000_000);
+    }
+
+    #[test]
+    fn reconfirm_due_logic() {
+        assert!(reconfirm_due(None));
+        let recent = std::time::Instant::now() - Duration::from_secs(10);
+        assert!(!reconfirm_due(Some(recent)));
+        let old = std::time::Instant::now() - Duration::from_secs(RECONFIRM_SECS + 30);
+        assert!(reconfirm_due(Some(old)));
     }
 
     /// 冒烟：扫描/缓存/汇总（本机有适配器则返回数据，无则优雅降级）

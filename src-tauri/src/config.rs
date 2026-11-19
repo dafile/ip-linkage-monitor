@@ -103,6 +103,14 @@ pub struct Config {    /// 监控程序（掌上看家采集端）exe 路径，�
     /// 离线确认时间（秒）：连续不可达达到该时长才判定离线，
     /// 避免蓝牙/WiFi 单次探测失败造成误离线并误触发联动
     pub offline_confirm_sec: u32,
+    /// 定时重启本程序（仅重启监控服务，绝不重启电脑）
+    pub auto_restart_enabled: bool,
+    /// 重启方式：interval（按运行间隔）| daily（每天定时）
+    pub auto_restart_mode: String,
+    /// 间隔模式的运行时长（分钟）
+    pub auto_restart_interval_min: u32,
+    /// 每日模式的重启时间（HH:MM）
+    pub auto_restart_daily_time: String,
     /// 联动规则列表
     pub rules: Vec<LinkageRule>,
     /// 是否已完成默认规则播种（避免用户删光规则后被再次生成）
@@ -123,6 +131,10 @@ impl Default for Config {
             poll_interval_sec: 3,
             ping_timeout_ms: 2000,
             offline_confirm_sec: 30,
+            auto_restart_enabled: false,
+            auto_restart_mode: "interval".to_string(),
+            auto_restart_interval_min: 60,
+            auto_restart_daily_time: "04:00".to_string(),
             rules: Vec::new(),
             rules_seeded: false,
         }

@@ -1,6 +1,6 @@
 [package]
 name = "ip-linkage-monitor"
-version = "1.5.1"
+version = "1.6.0"
 description = "掌上看家联动IP在线状态监控"
 edition = "2021"
 

@@ -39,6 +39,8 @@ pub struct Status {
     /// 已进入离线确认（尚未判定离线）
     pub offline_confirming: bool,
     pub offline_confirm_remaining_sec: u64,
+    /// 下次计划重启时间（未启用定时重启时为 None）
+    pub next_restart: Option<String>,
     pub pendings: Vec<PendingDto>,
     pub monitor_alive: bool,
 }
@@ -712,6 +714,7 @@ pub fn build_status(state: &AppState) -> Status {
         monitor_mode: cfg.monitor_mode.clone(),
         offline_confirming: m.offline_since.is_some(),
         offline_confirm_remaining_sec: confirm_remaining,
+        next_restart: crate::restart::next_due_text(),
         pendings,
         monitor_alive: m.last_tick.elapsed() < HEARTBEAT_TIMEOUT,
     }

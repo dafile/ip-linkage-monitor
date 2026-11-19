@@ -8,6 +8,7 @@ mod monitor;
 mod netcheck;
 mod process;
 mod registry;
+mod restart;
 mod state;
 mod tray;
 
@@ -84,7 +85,8 @@ fn main() {
 
             let app_state = Arc::new(state::AppState::load(&data_dir)?);
             app.manage(app_state.clone());
-            monitor::spawn_thread(handle.clone(), app_state);
+            monitor::spawn_thread(handle.clone(), app_state.clone());
+            restart::spawn_thread(handle.clone(), app_state);
 
             if let Err(e) = tray::create(&handle) {
                 logger::log(
