@@ -439,6 +439,7 @@ pub fn reset_sessions() {
             *t = None;
         }
     }
+    set_conn_suspect(false);
 }
 
 static PROBE: OnceLock<Mutex<ProbeCache>> = OnceLock::new();
@@ -453,10 +454,13 @@ const PROBE_NEG_TTL: Duration = Duration::from_millis(1500);
 const PROBE_MIN_GAP: Duration = Duration::from_millis(1200);
 
 /// 连接状态声称「在线」时的定期复核时间。
-/// Windows 蓝牙栈长期运行后可能保留陈旧的「已连接」缓存（手机蓝牙已关仍显示在线），
+/// Windows 蓝牙栈长期运行后可能保留陈旧的「已连接」缓存（手机离开/蓝牙已关仍显示在线），
 /// 因此每 RECONFIRM_SECS 用定向寻呼做一次“强证据”复核。
-const RECONFIRM_SECS: u64 = 300;
+const RECONFIRM_SECS: u64 = 30;
 static LAST_STRONG_CHECK: OnceLock<Mutex<Option<std::time::Instant>>> = OnceLock::new();
+/// 「连接状态已不可信」锁：定向探测明确不可达后置位。
+/// 置位期间系统缓存的“已连接”不再作为在线依据，必须探测到可达才恢复。
+static CONN_SUSPECT: OnceLock<Mutex<bool>> = OnceLock::new();
 
 fn reconfirm_due(last: Option<std::time::Instant>) -> bool {
     match last {
@@ -470,6 +474,25 @@ fn mark_strong_check() {
         .get_or_init(|| Mutex::new(None))
         .lock()
         .unwrap() = Some(std::time::Instant::now());
+}
+
+fn conn_suspect() -> bool {
+    *CONN_SUSPECT.get_or_init(|| Mutex::new(false)).lock().unwrap()
+}
+
+fn set_conn_suspect(v: bool) {
+    *CONN_SUSPECT.get_or_init(|| Mutex::new(false)).lock().unwrap() = v;
+}
+
+/// 连接状态声称在线时的最终判定：
+/// - 正常情况：探测明确不可达才判离线（未知继续信任连接）
+/// - 曾探测到不可达（suspect）：只有探测明确可达才恢复在线
+fn connected_claim_online(suspect: bool, probe: Option<bool>) -> bool {
+    if suspect {
+        probe == Some(true)
+    } else {
+        probe != Some(false)
+    }
 }
 /// 单次探测的看门狗（设备不可达时系统调用可能长时间阻塞）
 const PROBE_WATCHDOG: Duration = Duration::from_secs(6);
@@ -720,25 +743,34 @@ fn presence_detail_inner(
 
     if guard.is_some() || paired_classic.is_some() {
         if ble_connected || classic_conn {
-            // 连接状态可能来自陈旧的系统缓存：定期（或调用方要求时）用定向寻呼复核。
-            // 明确不可达 → 判离线，并丢弃维持连接会话以便下次重建。
+            // 连接状态可能来自陈旧的系统缓存：定期（或疑似失效时每轮）用定向寻呼复核。
             let last = *LAST_STRONG_CHECK
                 .get_or_init(|| Mutex::new(None))
                 .lock()
                 .unwrap();
+            let mut suspect = conn_suspect();
             let mut probe = None;
-            if force_probe || reconfirm_due(last) {
+            if force_probe || suspect || reconfirm_due(last) {
                 if let Some(addr) = best_probe_address(matcher, &link_addr, &classic) {
                     probe = rfcomm_probe(&addr, true);
-                    if probe.is_some() {
-                        mark_strong_check();
+                    match probe {
+                        Some(true) => {
+                            // 明确可达：恢复对连接状态的信任
+                            suspect = false;
+                            mark_strong_check();
+                        }
+                        Some(false) => {
+                            // 明确不可达：连接状态是陈旧缓存，判离线并丢弃维持连接
+                            suspect = true;
+                            mark_strong_check();
+                            *guard = None;
+                        }
+                        None => {} // 无法确认：不更新复核时间，下轮继续探测
                     }
+                    set_conn_suspect(suspect);
                 }
             }
-            let online = probe != Some(false);
-            if !online {
-                *guard = None;
-            }
+            let online = connected_claim_online(suspect, probe);
             return Ok(PresenceDetail {
                 online,
                 confirmed: true,
@@ -749,6 +781,8 @@ fn presence_detail_inner(
                 mode: "paired".into(),
             });
         }
+        // 连接状态已消失：视为新的连接事件，清除“陈旧缓存”锁
+        set_conn_suspect(false);
 
         // 手机的 BLE 空闲时不广播，系统主动连不上；改用定向寻呼探测。
         // 注意：不缓存负结果、失败要重试、Success 即视为可达（见 rfcomm_probe）。
@@ -907,6 +941,18 @@ mod tests {
         );
         let now = now_unix_ms();
         assert!(now > 1_700_000_000_000);
+    }
+
+    #[test]
+    fn connected_claim_logic() {
+        // 未怀疑：未知/可达均信任连接状态，仅明确不可达判离线
+        assert!(connected_claim_online(false, None));
+        assert!(connected_claim_online(false, Some(true)));
+        assert!(!connected_claim_online(false, Some(false)));
+        // 已确认陈旧（探测到过不可达）：只有再次明确可达才恢复在线
+        assert!(!connected_claim_online(true, None));
+        assert!(!connected_claim_online(true, Some(false)));
+        assert!(connected_claim_online(true, Some(true)));
     }
 
     #[test]

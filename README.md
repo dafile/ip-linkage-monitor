@@ -2,7 +2,7 @@
 
 [![Release](https://img.shields.io/github/v/release/dafile/ip-linkage-monitor?label=%E6%88%90%E5%93%81%E4%B8%8B%E8%BD%BD)](https://github.com/dafile/ip-linkage-monitor/releases)
 
-基于 **Tauri 2** 的 Windows 桌面工具（v1.6.2）：实时监控指定目标（**IP Ping** 或 **蓝牙邻近**，二选一）的
+基于 **Tauri 2** 的 Windows 桌面工具（v1.6.3）：实时监控指定目标（**IP Ping** 或 **蓝牙邻近**，二选一）的
 在线状态，按**可自由配置的联动规则**在目标上线/离线后延迟执行动作——启动/彻底关闭监控程序、
 显示/隐藏窗口，或**自定义执行任意脚本/程序**。支持系统托盘、**单实例运行**、**定时重启服务**、配置导入导出、完整日志记录与导出。
 
