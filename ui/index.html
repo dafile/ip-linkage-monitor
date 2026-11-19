@@ -333,7 +333,7 @@
     <div class="logo"></div>
     <div>
       <h1>掌上看家联动 IP 在线状态监控</h1>
-      <div class="sub">IP Linkage Monitor v1.6.0</div>
+      <div class="sub">IP Linkage Monitor v1.6.1</div>
     </div>
     <div class="spacer"></div>
     <div class="top-pills">
@@ -632,6 +632,10 @@
             <span class="track"></span><span class="thumb"></span>
           </label>
           <div class="desc">启用定时重启：<b>只重启本监控程序</b>，不会重启电脑、不影响采集端</div>
+        </div>
+        <div class="btn-row" style="margin-top:12px">
+          <button class="btn sm" id="btnRestartNow">🔄 立即重启服务</button>
+          <span class="form-note" style="margin:0">手动触发一次重启（只重启本程序，约 1~2 秒后自动恢复）</span>
         </div>
         <div class="form-row" style="margin-top:14px">
           <label>重启方式</label>
@@ -1256,6 +1260,19 @@ $("chkRestart").addEventListener("change", () => {
   cfg.auto_restart_enabled = $("chkRestart").checked;
   scheduleSave();
   applyRestartUI();
+});
+$("btnRestartNow").addEventListener("click", async () => {
+  const ok = await confirmBox(
+    "确定立即重启监控服务吗？只重启本程序，不会影响电脑与采集端；约 1~2 秒后自动恢复。",
+    "立即重启服务"
+  );
+  if (!ok) return;
+  try {
+    await invoke("restart_now");
+    toast("正在重启服务…窗口将短暂关闭并自动恢复", "", 5000);
+  } catch (e) {
+    toast("重启失败：" + e, "error", 6000);
+  }
 });
 $("selRestartMode").addEventListener("change", () => {
   cfg.auto_restart_mode = $("selRestartMode").value;

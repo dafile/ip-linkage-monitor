@@ -136,6 +136,7 @@ fn main() {
             commands::test_bluetooth,
             commands::bt_scan_devices,
             commands::bt_open_settings,
+            commands::restart_now,
             commands::run_action,
             commands::add_rule,
             commands::update_rule,

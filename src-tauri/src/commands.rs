@@ -750,6 +750,17 @@ pub fn bt_open_settings() -> Result<(), String> {
         .map_err(|e| format!("打开系统设置失败：{e}"))
 }
 
+/// 手动重启本程序（与定时重启同一通道；仅重启监控服务，不影响电脑与采集端）
+#[tauri::command]
+pub fn restart_now(app: AppHandle) -> Result<(), String> {
+    logger::log(INFO, CAT_USER, "手动重启：用户点击「立即重启服务」");
+    if crate::restart::relaunch_and_exit(&app) {
+        Ok(())
+    } else {
+        Err("重启失败：无法启动接力进程，详见运行日志".to_string())
+    }
+}
+
 /* ===================== 配置文件导入/导出 ===================== */
 
 #[tauri::command]

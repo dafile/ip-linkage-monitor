@@ -172,7 +172,8 @@ pub fn spawn_thread(app: AppHandle, state: Arc<AppState>) {
 
 /// 安排一个"等当前进程退出后再启动自身"的接力进程，然后退出当前程序。
 /// 返回 true 表示已安排成功并退出；false 表示失败（调用方可继续运行）。
-fn relaunch_and_exit(app: &AppHandle) -> bool {
+/// 既用于定时重启，也用于设置页的「立即重启服务」按钮。
+pub(crate) fn relaunch_and_exit(app: &AppHandle) -> bool {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
