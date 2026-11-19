@@ -10,6 +10,7 @@ use serde::Serialize;
 use std::path::Path;
 use std::process::Command;
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::AppHandle;
@@ -114,6 +115,33 @@ fn now_ts() -> String {
     Local::now().format("%H:%M:%S").to_string()
 }
 
+/// 软重启的实际重置动作（由监控线程在检测到 service_epoch 变化时执行）：
+/// 重置监控运行状态并释放蓝牙会话/缓存。
+/// 只作用于本进程内的监控服务——不退出进程、不重建窗口、不影响电脑与采集端。
+pub fn apply_soft_reset(state: &AppState) {
+    {
+        let mut m = state.monitor.lock().unwrap();
+        m.ip_online = None;
+        m.ip_last_check = Some(now_ts());
+        m.latency_ms = None;
+        m.last_transition = None;
+        m.offline_since = None;
+        m.offline_confirm_hits = 0;
+        m.unknown_count = 0;
+        m.unknown_log_at = None;
+        m.pending.clear();
+    }
+    bluetooth::reset_sessions();
+    let epoch = state.service_epoch.load(Ordering::SeqCst);
+    logger::log(
+        INFO,
+        CAT_MONITOR,
+        &format!(
+            "监控服务已软重启（第 {epoch} 代）：检测状态、待执行任务与蓝牙会话已重置；窗口与进程保持不变"
+        ),
+    );
+}
+
 pub fn spawn_thread(_app: AppHandle, state: Arc<AppState>) {
     // 联动任务到期检查线程：独立于主循环，保证延迟精度
     {
@@ -126,7 +154,15 @@ pub fn spawn_thread(_app: AppHandle, state: Arc<AppState>) {
     std::thread::spawn(move || {
         logger::log(INFO, CAT_MONITOR, "状态监控线程已启动");
         let mut scan_errors: u32 = 0;
+        let mut local_epoch = state.service_epoch.load(Ordering::Relaxed);
         loop {
+            // 软重启请求：重置检测状态与蓝牙会话（不退出进程、不重建窗口）
+            let epoch = state.service_epoch.load(Ordering::Relaxed);
+            if epoch != local_epoch {
+                local_epoch = epoch;
+                apply_soft_reset(&state);
+                scan_errors = 0;
+            }
             let cfg = state.config_snapshot();
             let generation = state.monitor.lock().unwrap().generation;
             let bt_mode = cfg.monitor_mode == "bluetooth";
@@ -881,6 +917,7 @@ mod tests {
     use super::*;
     use crate::config::ACT_STOP;
     use crate::state::AppState;
+    use std::sync::atomic::AtomicU64;
     use std::sync::Mutex;
 
     fn make_state(cfg: Config) -> Arc<AppState> {
@@ -889,7 +926,35 @@ mod tests {
             logs_dir: std::env::temp_dir(),
             config: Mutex::new(cfg),
             monitor: Mutex::new(MonitorInner::new()),
+            service_epoch: AtomicU64::new(1),
         })
+    }
+
+    /// 软重启重置：在线状态、确认窗口、待执行任务与代号都应回到初始
+    #[test]
+    fn soft_reset_clears_runtime_state() {
+        let state = make_state(Config::default());
+        {
+            let mut m = state.monitor.lock().unwrap();
+            m.ip_online = Some(true);
+            m.offline_since = Some(Instant::now());
+            m.offline_confirm_hits = 3;
+            m.pending.push(PendingAction {
+                rule_id: 1,
+                note: "t".into(),
+                action: RuleAction::simple(ACT_START),
+                trigger: TRIGGER_OFFLINE.into(),
+                fire_at: Instant::now() + Duration::from_secs(30),
+                due_ts: "00:00:00".into(),
+            });
+        }
+        state.service_epoch.store(2, Ordering::SeqCst);
+        apply_soft_reset(&state);
+        let m = state.monitor.lock().unwrap();
+        assert!(m.ip_online.is_none(), "在线状态应重置为未知");
+        assert!(m.offline_since.is_none(), "离线确认窗口应清空");
+        assert_eq!(m.offline_confirm_hits, 0);
+        assert!(m.pending.is_empty(), "待执行任务应清空");
     }
 
     /// 规则调度：方向、反转作废、取消、总开关

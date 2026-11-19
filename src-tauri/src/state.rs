@@ -4,6 +4,7 @@ use crate::monitor::MonitorInner;
 use crate::registry;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
 use std::sync::Mutex;
 
 /// 全局共享状态：配置 + 监控线程运行时状态
@@ -12,6 +13,9 @@ pub struct AppState {
     pub logs_dir: PathBuf,
     pub config: Mutex<Config>,
     pub monitor: Mutex<MonitorInner>,
+    /// 监控服务代次：递增即表示请求"软重启"（重置检测状态与蓝牙会话，
+    /// 不退出进程、不重建窗口）
+    pub service_epoch: AtomicU64,
 }
 
 impl AppState {
@@ -64,6 +68,7 @@ impl AppState {
             logs_dir: data_dir.join("logs"),
             config: Mutex::new(config),
             monitor: Mutex::new(MonitorInner::new()),
+            service_epoch: AtomicU64::new(1),
         };
 
         if !notices.is_empty() {

@@ -421,6 +421,26 @@ struct ProbeCache {
     last_attempt: Option<std::time::Instant>,
 }
 
+/// 软重启：释放系统维持连接会话（停止 BLE 维持）并清空探测/复核缓存。
+/// 只影响本进程内的蓝牙对象，不重启进程、不触碰系统蓝牙设置。
+pub fn reset_sessions() {
+    if let Some(lock) = LINK.get() {
+        if let Ok(mut g) = lock.lock() {
+            *g = None;
+        }
+    }
+    if let Some(cache) = PROBE.get() {
+        if let Ok(mut c) = cache.lock() {
+            *c = ProbeCache::default();
+        }
+    }
+    if let Some(lock) = LAST_STRONG_CHECK.get() {
+        if let Ok(mut t) = lock.lock() {
+            *t = None;
+        }
+    }
+}
+
 static PROBE: OnceLock<Mutex<ProbeCache>> = OnceLock::new();
 /// 同一时刻只允许一个真实寻呼，避免超时后线程堆积、蓝牙电台被反复争抢
 static PROBE_BUSY: AtomicBool = AtomicBool::new(false);

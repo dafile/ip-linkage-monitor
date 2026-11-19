@@ -6,9 +6,10 @@
 //!
 //! 注意：这里只重启本程序自身——**绝不重启或关机电脑**，也不影响被监控的采集端。
 
-use crate::logger::{self, CAT_SYSTEM, ERROR, INFO};
+use crate::logger::{self, CAT_SYSTEM, INFO};
 use crate::state::AppState;
 use chrono::{Local, NaiveDate, NaiveTime};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::AppHandle;
@@ -82,8 +83,8 @@ pub fn human_interval(minutes: u32) -> String {
     }
 }
 
-/// 启动定时重启调度线程
-pub fn spawn_thread(app: AppHandle, state: Arc<AppState>) {
+/// 启动定时重启调度线程（软重启：重置监控服务，不退出进程、不重建窗口）
+pub fn spawn_thread(_app: AppHandle, state: Arc<AppState>) {
     std::thread::spawn(move || {
         let boot = Local::now();
         let mut interval_anchor = Instant::now();
@@ -98,9 +99,25 @@ pub fn spawn_thread(app: AppHandle, state: Arc<AppState>) {
             }
         };
         let mut last_key = String::new();
+        let mut local_epoch = state.service_epoch.load(Ordering::Relaxed);
 
         loop {
             let cfg = state.config_snapshot();
+
+            // 软重启（手动按钮或其他来源）后重新计时
+            let epoch = state.service_epoch.load(Ordering::Relaxed);
+            if epoch != local_epoch {
+                local_epoch = epoch;
+                interval_anchor = Instant::now();
+                let now = Local::now();
+                last_daily = if now.time() >= parse_hhmm(&cfg.auto_restart_daily_time) {
+                    Some(now.date_naive())
+                } else {
+                    None
+                };
+                last_key.clear();
+            }
+
             if !cfg.auto_restart_enabled {
                 if !last_key.is_empty() {
                     interval_anchor = Instant::now();
@@ -137,14 +154,12 @@ pub fn spawn_thread(app: AppHandle, state: Arc<AppState>) {
                         INFO,
                         CAT_SYSTEM,
                         &format!(
-                            "定时重启：到达每日计划时间 {}，重启本程序（仅重启监控服务，不影响电脑与采集端）",
+                            "定时重启：到达每日计划时间 {}，执行软重启（重置检测状态与蓝牙会话，窗口与进程不变）",
                             when.format("%H:%M")
                         ),
                     );
-                    if relaunch_and_exit(&app) {
-                        return;
-                    }
-                    interval_anchor = Instant::now(); // 接力失败：稍后再试，避免紧凑重试
+                    local_epoch = request_soft_restart(&state);
+                    interval_anchor = Instant::now();
                 }
             } else {
                 let minutes = cfg.auto_restart_interval_min.clamp(5, 1440);
@@ -154,14 +169,12 @@ pub fn spawn_thread(app: AppHandle, state: Arc<AppState>) {
                         INFO,
                         CAT_SYSTEM,
                         &format!(
-                            "定时重启：已连续运行 {}，重启本程序（仅重启监控服务，不影响电脑与采集端）",
+                            "定时重启：已连续运行 {}，执行软重启（重置检测状态与蓝牙会话，窗口与进程不变）",
                             human_interval(minutes)
                         ),
                     );
-                    if relaunch_and_exit(&app) {
-                        return;
-                    }
-                    interval_anchor = Instant::now(); // 接力失败：重新计时
+                    local_epoch = request_soft_restart(&state);
+                    interval_anchor = Instant::now();
                 }
             }
 
@@ -170,59 +183,10 @@ pub fn spawn_thread(app: AppHandle, state: Arc<AppState>) {
     });
 }
 
-/// 安排一个"等当前进程退出后再启动自身"的接力进程，然后退出当前程序。
-/// 返回 true 表示已安排成功并退出；false 表示失败（调用方可继续运行）。
-/// 既用于定时重启，也用于设置页的「立即重启服务」按钮。
-pub(crate) fn relaunch_and_exit(app: &AppHandle) -> bool {
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(e) => {
-            logger::log(ERROR, CAT_SYSTEM, &format!("定时重启失败：无法获取程序路径：{e}"));
-            return false;
-        }
-    };
-    let exe_str = exe.display().to_string().replace('\'', "''");
-    let ps_path = std::env::var("SystemRoot")
-        .map(|r| format!(r"{r}\System32\WindowsPowerShell\v1.0\powershell.exe"))
-        .unwrap_or_else(|_| "powershell.exe".to_string());
-    let script = format!(
-        "Wait-Process -Id {} -Timeout 90 -ErrorAction SilentlyContinue; Start-Process -FilePath '{}'",
-        std::process::id(),
-        exe_str
-    );
-
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    match std::process::Command::new(ps_path)
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-WindowStyle",
-            "Hidden",
-            "-Command",
-            &script,
-        ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
-    {
-        Ok(_) => {
-            logger::log(
-                INFO,
-                CAT_SYSTEM,
-                "定时重启：已安排新进程接力，当前程序退出（单实例锁随后由新进程接管）",
-            );
-            app.exit(0);
-            true
-        }
-        Err(e) => {
-            logger::log(
-                ERROR,
-                CAT_SYSTEM,
-                &format!("定时重启失败（无法启动接力进程）：{e}"),
-            );
-            false
-        }
-    }
+/// 请求软重启：递增服务代号，监控线程会在下一轮检测前执行重置。
+/// 不退出进程、不重建窗口，也不影响电脑与采集端。返回新代号。
+pub fn request_soft_restart(state: &AppState) -> u64 {
+    state.service_epoch.fetch_add(1, Ordering::SeqCst) + 1
 }
 
 #[cfg(test)]
