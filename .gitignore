@@ -6,3 +6,4 @@ scripts/test-artifacts/
 *.log
 *.tmp
 .zcode/
+发布/*.zip
